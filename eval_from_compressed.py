@@ -144,33 +144,41 @@ def main():
         crop_hw=(Hc, Wc),
     )
 
-    # Convert back to physical units
+    # Convert back to physical units (if you care)
     gt    = gt_n * std + mean
     pred  = pred_n * std + mean
     err_n = np.abs(pred_n - gt_n)
 
     mse = float(np.mean((pred_n - gt_n) ** 2))
-    print(f"Slice (t={T_IDX}, z={Z_IDX}) MSE={mse:.3e}, PSNR={psnr(mse):.2f} dB")
+    psnr_val = psnr(mse)
+    print(f"Slice (t={T_IDX}, z={Z_IDX}) MSE={mse:.3e}, PSNR={psnr_val:.2f} dB")
 
-    # ----------- Plots -----------
+    # ----------- Figure 1: fields + error -----------
     ext = (0, 1, 0, 1)
     vmax_err = err_n.max() + 1e-8
 
-    # Figure 1: fields + error
     fig, axs = plt.subplots(1, 3, figsize=(12, 4))
 
+    # Ground truth
     im0 = axs[0].imshow(gt, origin="lower", extent=ext, cmap="viridis")
-    axs[0].set_title(f"Ground Truth ({orig_mb:.4f} MB)")
+    axs[0].set_title(
+        f"Ground Truth\n({orig_mb:.4f} MB)",
+        fontsize=10,
+    )
     axs[0].axis("off")
     plt.colorbar(im0, ax=axs[0], fraction=0.046, pad=0.04)
 
+    # AE-conditioned implicit model
     im1 = axs[1].imshow(pred, origin="lower", extent=ext, cmap="viridis")
     axs[1].set_title(
-        f"AE-cond implicit ({enc_mb:.6f} MB, {compression_factor:.2f}x reduction)"
+        "AE-cond Implicit\n"
+        f"({enc_mb:.6f} MB, {compression_factor:.2f}x, PSNR={psnr_val:.2f} dB)",
+        fontsize=10,
     )
     axs[1].axis("off")
     plt.colorbar(im1, ax=axs[1], fraction=0.046, pad=0.04)
 
+    # Error field
     im2 = axs[2].imshow(
         err_n / vmax_err,
         origin="lower",
@@ -179,15 +187,15 @@ def main():
         vmin=0,
         vmax=1,
     )
-    axs[2].set_title("|pred - gt| (normalized)")
+    axs[2].set_title("|pred - gt|\n(normalized)", fontsize=10)
     axs[2].axis("off")
     plt.colorbar(im2, ax=axs[2], fraction=0.046, pad=0.04)
 
-    fig.suptitle(f"t={T_IDX}, z={Z_IDX}")
+    fig.suptitle(f"t={T_IDX}, z={Z_IDX}", fontsize=12)
     plt.tight_layout()
     plt.show()
 
-    # Figure 2: iso-contours
+    # ----------- Figure 2: iso-contours -----------
     xs = np.linspace(0, 1, Wc)
     ys = np.linspace(0, 1, Hc)
     Xg, Yg = np.meshgrid(xs, ys, indexing="xy")
@@ -214,11 +222,13 @@ def main():
         linestyles="dashed",
     )
     plt.title(
-        f"Iso-contours (t={T_IDX}, z={Z_IDX}) — {compression_factor:.2f}x "
-        f"(GT={orig_mb:.4f} MB → AE={enc_mb:.6f} MB)"
+        "Iso-contours (GT: white, AE: magenta)\n"
+        f"{compression_factor:.2f}x, PSNR={psnr_val:.2f} dB",
+        fontsize=10,
     )
     plt.axis("equal")
     plt.axis("off")
+    plt.tight_layout()
     plt.show()
 
 
