@@ -1,0 +1,5 @@
+Has an AE for some test data.
+Takes the latent vector and trains an implicit function.
+Render the implicit function
+extract contours of the implicit function.
+Uses a quadtree to determine what x,y values of hte implicit to evaluate
