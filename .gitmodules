@@ -1,3 +1,6 @@
-[submodule "external/CAESAR"]
-	path = external/CAESAR
+[submodule "pyCAESAR"]
+	path = external/pyCAESAR
 	url = https://github.com/dpugmire/CAESAR.git
+[submodule "CAESAR"]
+	path = external/CAESAR
+	url = https://github.com/UFcompressor/CAESAR.git

@@ -1,8 +1,12 @@
 # CAESAR experiments
 
 These MAGNET-owned scripts investigate visualization operations on CAESAR latent
-representations. The CAESAR implementation is pinned separately as the
-`external/CAESAR` Git submodule.
+representations. Two CAESAR implementations are pinned as Git submodules:
+
+- `external/pyCAESAR` is the Python fork currently used by these experiments. It
+  exposes the quantized latent tensor required by the MAGNET renderers.
+- `external/CAESAR` is the official UFcompressor C++/LibTorch implementation and
+  is the target for future integration work.
 
 Initialize the dependency after cloning MAGNET:
 
@@ -10,13 +14,16 @@ Initialize the dependency after cloning MAGNET:
 git submodule update --init --recursive
 ```
 
-CAESAR is not currently packaged for installation. Add the submodule root to
-`PYTHONPATH` when running an experiment from the MAGNET repository root:
+The Python fork is not currently packaged for installation. Add its submodule
+root to `PYTHONPATH` when running an experiment from the MAGNET repository root:
 
 ```bash
-PYTHONPATH=external/CAESAR \
+PYTHONPATH=external/pyCAESAR \
   python caesar_experiments/train_heatmap_renderer.py --help
 ```
+
+The internal Python package remains named `CAESAR`, so experiment imports such
+as `from CAESAR.compressor import CAESAR` do not change.
 
 The scripts expect dataset, checkpoint, and latent paths to be supplied on the
 command line. Those large artifacts are intentionally excluded from Git.

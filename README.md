@@ -57,11 +57,13 @@ than a reusable contouring library.
 
 ### CAESAR latent representations
 
-`external/CAESAR` pins a fork of CAESAR (*Conditional AutoEncoder with
-Super-resolution for Augmented Reduction*), a learned compressor for
-spatiotemporal scientific data. CAESAR-V combines an autoencoder, entropy model,
-scale hyperprior, and super-resolution decoder. CAESAR-D additionally uses
-conditional diffusion to interpolate missing latent frames.
+`external/pyCAESAR` pins the Python CAESAR fork currently used by MAGNET, while
+`external/CAESAR` pins the official UFcompressor C++/LibTorch implementation.
+CAESAR (*Conditional AutoEncoder with Super-resolution for Augmented Reduction*)
+is a learned compressor for spatiotemporal scientific data. CAESAR-V combines
+an autoencoder, entropy model, scale hyperprior, and super-resolution decoder.
+CAESAR-D additionally uses conditional diffusion to interpolate missing latent
+frames.
 
 The MAGNET-specific scripts under `caesar_experiments/` use CAESAR's quantized
 latent field in two ways:
@@ -121,7 +123,8 @@ training.
 scalar/                   Scalar AE + INR pipeline and earlier prototypes
 meshless/                 Adaptive implicit rendering and contour experiments
 caesar_experiments/       MAGNET experiments using CAESAR latent fields
-external/CAESAR/          Pinned CAESAR fork (Git submodule)
+external/pyCAESAR/        Python CAESAR fork with latent access (submodule)
+external/CAESAR/          Official UFcompressor CAESAR (submodule)
 streamlines/              ADIOS2 vector INR and streamline evaluation
 topology/                 AE reconstruction and persistent-homology evaluation
 tools/                    Small data-conversion utilities
@@ -133,13 +136,13 @@ autoresearch/             Unrelated nested autoresearch-mlx checkout
 ```
 
 This is not yet a unified Python package. The TensorFlow scalar experiments,
-PyTorch/ADIOS2 workflows, Gudhi topology code, and CUDA-oriented CAESAR fork use
+PyTorch/ADIOS2 workflows, Gudhi topology code, and CAESAR dependencies use
 separate environments and assumptions. There is currently no integrated test
 suite.
 
 Generated artifacts and historical working copies are excluded from the main
-repository. CAESAR remains an independent repository and is incorporated
-through a pinned Git submodule.
+repository. The Python and official CAESAR implementations remain independent
+repositories incorporated through pinned Git submodules.
 
 ## Interpretation and current limitations
 
