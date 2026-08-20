@@ -1,0 +1,3 @@
+[submodule "external/CAESAR"]
+	path = external/CAESAR
+	url = https://github.com/dpugmire/CAESAR.git

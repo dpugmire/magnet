@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-import os
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 np.random.seed(0)
 tf.random.set_seed(0)
@@ -11,19 +11,20 @@ tf.random.set_seed(0)
 # Config
 # ============================================================
 
-DATA_FILE = "data/xcompact-TG.npy"  # shape (T=200, Z=8, Y=129, X=128)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DATA_FILE = REPO_ROOT / "data" / "xcompact-TG.npy"  # shape (T=200, Z=8, Y=129, X=128)
 
 # Training toggles
 TRAIN_DIRECT_IMPLICIT = True
 TRAIN_AE_IMPLICIT     = True
 
-# Direct implicit hyperparams
+# Direct implicit model hyperparams
 BATCH_SIZE_DIRECT     = 4096
 EPOCHS_DIRECT         = 30
 STEPS_PER_EPOCH_DIR   = 200
 VAL_SAMPLES_DIRECT    = 20000
 IMPORTANCE_PERCENTILE = 75.0
-IMPORTANCE_FRACTION   = 0.5
+IMPORTANCE_FRACTION   = 0.5   # fraction of each batch from important region
 
 # AE + implicit hyperparams
 AE_LATENT_CHANNELS    = 8
@@ -35,22 +36,9 @@ EPOCHS_AE_IMPL        = 30
 STEPS_PER_EPOCH_AE    = 200
 VAL_SAMPLES_AE_IMPL   = 20000
 
-# Slice to evaluate / compress
+# Slice to evaluate / compare
 EVAL_T_IDX = 50
 EVAL_Z_IDX = 3
-
-# Where to save stuff
-MODEL_DIR = "saved_models"
-os.makedirs(MODEL_DIR, exist_ok=True)
-
-AE_AUTO_PATH    = os.path.join(MODEL_DIR, "ae_auto.keras")
-AE_ENCODER_PATH = os.path.join(MODEL_DIR, "ae_encoder.keras")
-AE_DECODER_PATH = os.path.join(MODEL_DIR, "ae_decoder.keras")
-
-DIRECT_MODEL_PATH  = os.path.join(MODEL_DIR, "direct_implicit.keras")
-AE_IMPL_MODEL_PATH = os.path.join(MODEL_DIR, "ae_implicit.keras")
-
-COMPRESSED_LATENTS_PATH = os.path.join(MODEL_DIR, f"compressed_latents_z{EVAL_Z_IDX}.npy")
 
 
 # ============================================================
@@ -59,9 +47,9 @@ COMPRESSED_LATENTS_PATH = os.path.join(MODEL_DIR, f"compressed_latents_z{EVAL_Z_
 
 def load_and_normalize(data_file):
     print(f"Loading data from {data_file} ...")
-    data = np.load(data_file).astype(np.float32)  # [T,Z,Y,X]
+    data = np.load(data_file).astype(np.float32)  # shape (T,Z,Y,X)
     if data.ndim != 4:
-        raise ValueError(f"Expected 4D array (T,Z,Y,X), got {data.shape}")
+        raise ValueError(f"Expected 4D array (T,Z,Y,X), got shape {data.shape}")
 
     T, Z, Y, X = data.shape
     print(f"Data shape: T={T}, Z={Z}, Y={Y}, X={X}")
@@ -73,7 +61,10 @@ def load_and_normalize(data_file):
     data_norm = (data - scalar_mean) / scalar_std
 
     coord_info = {
-        "T": T, "Z": Z, "Y": Y, "X": X,
+        "T": T,
+        "Z": Z,
+        "Y": Y,
+        "X": X,
         "scalar_mean": scalar_mean,
         "scalar_std": scalar_std,
     }
@@ -81,21 +72,25 @@ def load_and_normalize(data_file):
 
 
 # ============================================================
-# 2) Importance sampling (for direct model)
+# 2) Importance sampling (gradient-based)
 # ============================================================
 
 def compute_importance_indices(data_norm, percentile=75.0):
+    """
+    Compute gradient magnitude in (y,x), return indices (t,z,y,x)
+    where grad_mag is above given percentile.
+    """
     print("\nComputing gradient-based importance mask...")
     gy, gx = np.gradient(data_norm, axis=(2, 3))
     grad_mag = np.sqrt(gx**2 + gy**2)
 
     thresh = np.percentile(grad_mag, percentile)
-    mask = grad_mag > thresh
-    idx = np.argwhere(mask)
+    important_mask = grad_mag > thresh
+    important_indices = np.argwhere(important_mask)
 
-    print(f"Importance threshold (p{percentile}) = {thresh:.4e}")
-    print(f"Important voxels: {idx.shape[0]}")
-    return idx
+    print(f"Importance threshold (percentile {percentile}): {thresh:.4e}")
+    print(f"Number of important voxels: {important_indices.shape[0]}")
+    return important_indices
 
 
 # ============================================================
@@ -106,6 +101,9 @@ def make_training_dataset_direct(data_norm, coord_info,
                                  important_indices=None,
                                  importance_fraction=0.5,
                                  batch_size=4096):
+    """
+    For direct model: sample (t,z,y,x) -> coords [x,y,t,z], value.
+    """
     T, Z, Y, X = coord_info["T"], coord_info["Z"], coord_info["Y"], coord_info["X"]
     has_imp = important_indices is not None and important_indices.shape[0] > 0
     if not has_imp:
@@ -144,11 +142,11 @@ def make_training_dataset_direct(data_norm, coord_info,
 
             yield coords.astype(np.float32), vals.astype(np.float32)
 
-    out_sig = (
+    output_signature = (
         tf.TensorSpec(shape=(None, 4), dtype=tf.float32),
         tf.TensorSpec(shape=(None, 1), dtype=tf.float32),
     )
-    ds = tf.data.Dataset.from_generator(gen, output_signature=out_sig)
+    ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -177,25 +175,29 @@ def make_validation_dataset_direct(data_norm, coord_info,
 
 
 # ============================================================
-# 4) Positional encodings + direct implicit model
+# 4) Positional encoding + direct implicit model
 # ============================================================
 
 def positional_encoding_tf(coords, L_xy=6, L_tz=2):
     """
     coords: [B,4] = (x,y,t,z) in [0,1]
+    returns: [B,D] with raw coords + sin/cos features.
     """
     pi = tf.constant(np.pi, dtype=tf.float32)
+
     x = coords[..., 0:1]
     y = coords[..., 1:2]
     t = coords[..., 2:3]
     z = coords[..., 3:4]
 
     outs = [x, y, t, z]
+
     for k in range(L_xy):
         freq = (2.0 ** k) * pi
         for c in (x, y):
             outs.append(tf.sin(freq * c))
             outs.append(tf.cos(freq * c))
+
     for k in range(L_tz):
         freq = (2.0 ** k) * pi
         for c in (t, z):
@@ -209,17 +211,17 @@ def build_direct_implicit_model(hidden=256, depth=6, L_xy=6, L_tz=2):
     coords_in = tf.keras.Input(shape=(4,), name="coords")  # x,y,t,z
 
     enc = tf.keras.layers.Lambda(
-        positional_encoding_tf,
-        arguments={"L_xy": L_xy, "L_tz": L_tz},
+        lambda c: positional_encoding_tf(c, L_xy=L_xy, L_tz=L_tz),
         name="posenc"
     )(coords_in)
 
     x = enc
     for i in range(depth):
         x = tf.keras.layers.Dense(hidden, activation='relu', name=f"mlp_{i}")(x)
-    out = tf.keras.layers.Dense(1, activation=None, name="u_norm")(x)
 
-    return tf.keras.Model(coords_in, out, name="direct_implicit")
+    out = tf.keras.layers.Dense(1, activation=None, name="u_norm")(x)
+    model = tf.keras.Model(coords_in, out, name="direct_implicit")
+    return model
 
 
 # ============================================================
@@ -227,6 +229,12 @@ def build_direct_implicit_model(hidden=256, depth=6, L_xy=6, L_tz=2):
 # ============================================================
 
 def build_autoencoder(latent_channels=8, encoder_filters=(32, 64, 128)):
+    """
+    Conv autoencoder:
+      input  : [128,128,1]
+      latent : (H_lat,W_lat,C) where H_lat/W_lat = 128 / 2^len(encoder_filters)
+      output : [128,128,1]
+    """
     inp = tf.keras.Input(shape=(128,128,1))
 
     x = inp
@@ -238,6 +246,7 @@ def build_autoencoder(latent_channels=8, encoder_filters=(32, 64, 128)):
         latent_channels, 3, strides=1, padding='same', activation='relu', name='latent'
     )(x)
 
+    # decoder
     y = latent
     decoder_layers = []
     for i,f in enumerate(reversed(encoder_filters)):
@@ -246,7 +255,6 @@ def build_autoencoder(latent_channels=8, encoder_filters=(32, 64, 128)):
         )
         y = layer(y)
         decoder_layers.append(layer)
-
     out_layer = tf.keras.layers.Conv2D(
         1, 3, padding='same', activation=None, name='dec_out'
     )
@@ -269,30 +277,39 @@ def build_autoencoder(latent_channels=8, encoder_filters=(32, 64, 128)):
 
 def build_ae_dataset_from_volume(data_norm, coord_info):
     """
-    All (t,z) slices cropped to 128x128.
+    Build AE training dataset from all (t,z) slices.
+    data_norm: [T,Z,Y,X] (normalized)
+    Returns X_ae [N_slices,128,128,1]
     """
     T, Z, Y, X = coord_info["T"], coord_info["Z"], coord_info["Y"], coord_info["X"]
     target_h, target_w = 128, 128
-    Yc, Xc = min(target_h, Y), min(target_w, X)
+
+    if Y < target_h or X < target_w:
+        raise ValueError("Volume smaller than 128x128; adjust code.")
 
     print("\nBuilding AE dataset from all (t,z) slices...")
     slices = []
     for t in range(T):
         for z in range(Z):
-            img = data_norm[t, z, :, :]
-            cropped = img[:Yc, :Xc]
+            img = data_norm[t, z, :, :]    # [Y,X]
+            cropped = img[:target_h, :target_w]  # [128,128]
             slices.append(cropped[..., None])
-    X_ae = np.stack(slices, axis=0).astype(np.float32)
+
+    X_ae = np.stack(slices, axis=0).astype(np.float32)  # [N_slices,128,128,1]
     print(f"AE dataset shape: {X_ae.shape} (N_slices={X_ae.shape[0]})")
-    return X_ae, (Yc, Xc)
+    return X_ae
 
 
 def compute_slice_latents(encoder, X_ae, coord_info, latent_channels):
+    """
+    Run encoder over all slices and global-average-pool to vectors:
+      latents[t,z,:]  with shape [T,Z,C]
+    """
     T, Z = coord_info["T"], coord_info["Z"]
     print("\nEncoding all slices to latent space...")
     Z_grid = encoder.predict(X_ae, batch_size=32, verbose=0)  # [N_slices,H_lat,W_lat,C]
     N_slices, H_lat, W_lat, C = Z_grid.shape
-    assert N_slices == T * Z
+    assert N_slices == T*Z
 
     Z_vec_all = Z_grid.mean(axis=(1,2))  # [N_slices,C]
     latents = Z_vec_all.reshape(T, Z, C)
@@ -305,61 +322,62 @@ def compute_slice_latents(encoder, X_ae, coord_info, latent_channels):
 # ============================================================
 
 def make_training_dataset_ae_impl(data_norm, coord_info, latents,
-                                  crop_hw, batch_size=4096):
+                                  batch_size=4096):
     """
-    For AE-cond model: sample (t,z,y,x) within cropped area, use latent(t,z)
-    and coords2=(x,y).
+    For AE-conditioned model:
+      pick (t,z) slice -> sample (y,x) -> coords2 (x,y) and latent vector z(t,z).
+    Model input: [coords2, latent], output scalar.
     """
     T, Z, Y, X = coord_info["T"], coord_info["Z"], coord_info["Y"], coord_info["X"]
     C = latents.shape[-1]
-    Hc, Wc = crop_hw
 
     def gen():
         while True:
             t_idx = np.random.randint(0, T, size=1)[0]
             z_idx = np.random.randint(0, Z, size=1)[0]
 
-            ys = np.random.randint(0, Hc, size=batch_size)
-            xs = np.random.randint(0, Wc, size=batch_size)
+            ys = np.random.randint(0, Y, size=batch_size)
+            xs = np.random.randint(0, X, size=batch_size)
 
-            x_norm = xs.astype(np.float32) / (Wc - 1)
-            y_norm = ys.astype(np.float32) / (Hc - 1)
+            x_norm = xs.astype(np.float32) / (X - 1)
+            y_norm = ys.astype(np.float32) / (Y - 1)
             coords2 = np.stack([x_norm, y_norm], axis=-1)  # [B,2]
 
             vals = data_norm[t_idx, z_idx, ys, xs][..., None]  # [B,1]
 
             latent_vec = latents[t_idx, z_idx]  # [C]
-            z_rep = np.broadcast_to(latent_vec, (batch_size, C))
+            z_rep = np.broadcast_to(latent_vec, (batch_size, C))  # [B,C]
 
             yield (coords2.astype(np.float32), z_rep.astype(np.float32)), vals.astype(np.float32)
 
-    out_sig = (
+    output_signature = (
         (tf.TensorSpec(shape=(None,2), dtype=tf.float32),
          tf.TensorSpec(shape=(None,latents.shape[-1]), dtype=tf.float32)),
         tf.TensorSpec(shape=(None,1), dtype=tf.float32),
     )
-    ds = tf.data.Dataset.from_generator(gen, output_signature=out_sig)
+
+    ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
 
 def make_validation_dataset_ae_impl(data_norm, coord_info, latents,
-                                    crop_hw, num_samples=20000,
+                                    num_samples=20000,
                                     batch_size=4096):
     T, Z, Y, X = coord_info["T"], coord_info["Z"], coord_info["Y"], coord_info["X"]
-    Hc, Wc = crop_hw
     C = latents.shape[-1]
 
     t_idx = np.random.randint(0, T, size=num_samples)
     z_idx = np.random.randint(0, Z, size=num_samples)
-    y_idx = np.random.randint(0, Hc, size=num_samples)
-    x_idx = np.random.randint(0, Wc, size=num_samples)
+    y_idx = np.random.randint(0, Y, size=num_samples)
+    x_idx = np.random.randint(0, X, size=num_samples)
 
-    x_norm = x_idx.astype(np.float32) / (Wc - 1)
-    y_norm = y_idx.astype(np.float32) / (Hc - 1)
-    coords2 = np.stack([x_norm, y_norm], axis=-1).astype(np.float32)
+    x_norm = x_idx.astype(np.float32) / (X - 1)
+    y_norm = y_idx.astype(np.float32) / (Y - 1)
+    coords2 = np.stack([x_norm, y_norm], axis=-1).astype(np.float32)  # [N,2]
 
     vals = data_norm[t_idx, z_idx, y_idx, x_idx][..., None].astype(np.float32)
+
     latent_vecs = latents[t_idx, z_idx]  # [N,C]
 
     ds = tf.data.Dataset.from_tensor_slices(((coords2, latent_vecs), vals))
@@ -374,11 +392,11 @@ def make_validation_dataset_ae_impl(data_norm, coord_info, latents,
 def positional_encoding_2d_tf(xy, L=6):
     """
     xy: [B,2] = (x,y) in [0,1]
+    returns raw xy + sin/cos features
     """
     pi = tf.constant(np.pi, dtype=tf.float32)
     x = xy[..., 0:1]
     y = xy[..., 1:2]
-
     outs = [x, y]
     for k in range(L):
         freq = (2.0 ** k) * pi
@@ -389,46 +407,123 @@ def positional_encoding_2d_tf(xy, L=6):
 
 
 def build_ae_implicit_model(latent_dim, hidden=256, depth=6, L_xy=6):
-    coords2_in = tf.keras.Input(shape=(2,), name="xy")
-    latent_in  = tf.keras.Input(shape=(latent_dim,), name="z_lat")
+    coords2_in = tf.keras.Input(shape=(2,), name="xy")           # x,y
+    latent_in  = tf.keras.Input(shape=(latent_dim,), name="z_lat")  # AE latent
 
     enc_xy = tf.keras.layers.Lambda(
-        positional_encoding_2d_tf,
-        arguments={"L": L_xy},
+        lambda u: positional_encoding_2d_tf(u, L=L_xy),
         name="posenc_xy"
     )(coords2_in)
 
     h = tf.keras.layers.Concatenate(name="concat_xy_lat")([enc_xy, latent_in])
     for i in range(depth):
         h = tf.keras.layers.Dense(hidden, activation='relu', name=f"mlp_{i}")(h)
-    out = tf.keras.layers.Dense(1, activation=None, name="u_norm")(h)
 
-    return tf.keras.Model([coords2_in, latent_in], out, name="ae_cond_implicit")
+    out = tf.keras.layers.Dense(1, activation=None, name="u_norm")(h)
+    model = tf.keras.Model(inputs=[coords2_in, latent_in], outputs=out,
+                           name="ae_conditioned_implicit")
+    return model
 
 
 # ============================================================
-# 8) Utilities
+# 8) Metrics & plotting
 # ============================================================
 
 def psnr(mse):
     return -10.0 * np.log10(mse + 1e-12)
 
 
-def evaluate_slice_ae_impl(model, data_norm, coord_info, latents, crop_hw, t_idx, z_idx):
+def evaluate_slice_direct(model, data_norm, coord_info, t_idx, z_idx):
     T, Z, Y, X = coord_info["T"], coord_info["Z"], coord_info["Y"], coord_info["X"]
-    Hc, Wc = crop_hw
-    gt = data_norm[t_idx, z_idx, :Hc, :Wc]
+    gt = data_norm[t_idx, z_idx, :, :]  # [Y,X]
 
-    xs = np.linspace(0.0, 1.0, Wc, dtype=np.float32)
-    ys = np.linspace(0.0, 1.0, Hc, dtype=np.float32)
+    xs = np.linspace(0.0, 1.0, X, dtype=np.float32)
+    ys = np.linspace(0.0, 1.0, Y, dtype=np.float32)
     Xg, Yg = np.meshgrid(xs, ys, indexing='xy')
-    coords2 = np.stack([Xg, Yg], axis=-1).reshape(-1,2)
 
-    latent_vec = latents[t_idx, z_idx]
-    z_rep = np.broadcast_to(latent_vec, (coords2.shape[0], latent_vec.shape[0]))
+    t_norm = np.full_like(Xg, t_idx / (T - 1), dtype=np.float32)
+    z_norm = np.full_like(Xg, z_idx / (Z - 1), dtype=np.float32)
 
-    preds = model.predict([coords2, z_rep], batch_size=4096, verbose=0).reshape(Hc, Wc)
+    coords = np.stack([Xg, Yg, t_norm, z_norm], axis=-1).reshape(-1,4)
+    preds  = model.predict(coords, batch_size=4096, verbose=0).reshape(Y,X)
     return gt, preds
+
+
+def evaluate_slice_ae_impl(model, data_norm, coord_info, latents, t_idx, z_idx):
+    T, Z, Y, X = coord_info["T"], coord_info["Z"], coord_info["Y"], coord_info["X"]
+    gt = data_norm[t_idx, z_idx, :, :]  # [Y,X]
+
+    xs = np.linspace(0.0, 1.0, X, dtype=np.float32)
+    ys = np.linspace(0.0, 1.0, Y, dtype=np.float32)
+    Xg, Yg = np.meshgrid(xs, ys, indexing='xy')
+
+    coords2 = np.stack([Xg, Yg], axis=-1).reshape(-1,2)
+    latent_vec = latents[t_idx, z_idx]  # [C]
+    z_rep = np.broadcast_to(latent_vec, (coords2.shape[0], latent_vec.shape[0]))
+    preds  = model.predict([coords2, z_rep], batch_size=4096, verbose=0).reshape(Y,X)
+    return gt, preds
+
+
+def plot_three_way(gt_norm, pred_direct_norm, pred_ae_norm,
+                   coord_info, title_suffix=""):
+    mean = coord_info["scalar_mean"]
+    std  = coord_info["scalar_std"]
+
+    gt      = gt_norm * std + mean
+    pred_d  = pred_direct_norm * std + mean if pred_direct_norm is not None else None
+    pred_ae = pred_ae_norm * std + mean if pred_ae_norm is not None else None
+
+    Y, X = gt_norm.shape
+    ext = (0,1,0,1)
+
+    ncols = 1 + int(pred_direct_norm is not None) + int(pred_ae_norm is not None)
+    fig, axs = plt.subplots(1, ncols, figsize=(4*ncols, 4))
+
+    col = 0
+    im0 = axs[col].imshow(gt, origin='lower', extent=ext, cmap='viridis')
+    axs[col].set_title("Ground truth")
+    axs[col].axis('off')
+    plt.colorbar(im0, ax=axs[col], fraction=0.046, pad=0.04)
+    col += 1
+
+    if pred_direct_norm is not None:
+        im1 = axs[col].imshow(pred_d, origin='lower', extent=ext, cmap='viridis')
+        mse_d = float(np.mean((pred_direct_norm - gt_norm)**2))
+        axs[col].set_title(f"Direct implicit\nMSE={mse_d:.2e}, PSNR={psnr(mse_d):.1f} dB")
+        axs[col].axis('off')
+        plt.colorbar(im1, ax=axs[col], fraction=0.046, pad=0.04)
+        col += 1
+
+    if pred_ae_norm is not None:
+        im2 = axs[col].imshow(pred_ae, origin='lower', extent=ext, cmap='viridis')
+        mse_ae = float(np.mean((pred_ae_norm - gt_norm)**2))
+        axs[col].set_title(f"AE-cond implicit\nMSE={mse_ae:.2e}, PSNR={psnr(mse_ae):.1f} dB")
+        axs[col].axis('off')
+        plt.colorbar(im2, ax=axs[col], fraction=0.046, pad=0.04)
+
+    fig.suptitle(f"Slice comparison {title_suffix}")
+    plt.tight_layout()
+    plt.show()
+
+    # Iso-contour overlay
+    xs = np.linspace(0,1,X)
+    ys = np.linspace(0,1,Y)
+    Xg, Yg = np.meshgrid(xs, ys, indexing='xy')
+    levels = np.linspace(gt.min(), gt.max(), 5)[1:-1]
+
+    plt.figure(figsize=(6,6))
+    plt.imshow(gt, origin='lower', extent=ext, cmap='gray')
+    plt.contour(Xg, Yg, gt, levels=levels, colors='white', linewidths=2.0, linestyles='solid')
+
+    if pred_direct_norm is not None:
+        plt.contour(Xg, Yg, pred_d, levels=levels, colors='cyan', linewidths=1.5, linestyles='dashed', label='Direct')
+
+    if pred_ae_norm is not None:
+        plt.contour(Xg, Yg, pred_ae, levels=levels, colors='magenta', linewidths=1.5, linestyles='dotted', label='AE-impl')
+
+    plt.title(f"Iso-contours {title_suffix}")
+    plt.axis('equal'); plt.axis('off')
+    plt.show()
 
 
 # ============================================================
@@ -438,12 +533,15 @@ def evaluate_slice_ae_impl(model, data_norm, coord_info, latents, crop_hw, t_idx
 def main():
     data_norm, coord_info = load_and_normalize(DATA_FILE)
 
-    # -------- Direct implicit model --------
+    # ---------- Direct implicit model ----------
     if TRAIN_DIRECT_IMPLICIT:
-        important_idx = compute_importance_indices(data_norm, percentile=IMPORTANCE_PERCENTILE)
+        important_indices = compute_importance_indices(
+            data_norm, percentile=IMPORTANCE_PERCENTILE
+        )
+
         train_ds_dir = make_training_dataset_direct(
             data_norm, coord_info,
-            important_indices=important_idx,
+            important_indices=important_indices,
             importance_fraction=IMPORTANCE_FRACTION,
             batch_size=BATCH_SIZE_DIRECT
         )
@@ -454,7 +552,10 @@ def main():
         )
 
         direct_model = build_direct_implicit_model()
-        direct_model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss='mse')
+        direct_model.compile(
+            optimizer=tf.keras.optimizers.Adam(1e-3),
+            loss='mse'
+        )
         direct_model.summary()
 
         lr_sched = tf.keras.callbacks.ReduceLROnPlateau(
@@ -470,17 +571,13 @@ def main():
             callbacks=[lr_sched],
             verbose=1
         )
-
-        # ----- Save direct implicit model -----
-        print(f"\nSaving direct implicit model to {DIRECT_MODEL_PATH}")
-        direct_model.save(DIRECT_MODEL_PATH)
     else:
         direct_model = None
 
-    # -------- AE + implicit pipeline --------
+    # ---------- AE + implicit model ----------
     if TRAIN_AE_IMPLICIT:
         # AE training
-        X_ae, crop_hw = build_ae_dataset_from_volume(data_norm, coord_info)
+        X_ae = build_ae_dataset_from_volume(data_norm, coord_info)
         N_slices = X_ae.shape[0]
         n_val = max(1, N_slices // 10)
         X_ae_tr = X_ae[:-n_val]
@@ -502,40 +599,27 @@ def main():
             verbose=1
         )
 
-        # ----- Save AE models -----
-        print(f"\nSaving AE models to {MODEL_DIR}")
-        auto.save(AE_AUTO_PATH)
-        encoder.save(AE_ENCODER_PATH)
-        decoder.save(AE_DECODER_PATH)
-
         # Latent vectors per (t,z)
         latents, latent_dim = compute_slice_latents(
             encoder, X_ae, coord_info, AE_LATENT_CHANNELS
         )
 
-        # ----- Save compressed timeseries for fixed Z -----
-        T = coord_info["T"]
-        Z = coord_info["Z"]
-        if not (0 <= EVAL_Z_IDX < Z):
-            raise ValueError(f"EVAL_Z_IDX={EVAL_Z_IDX} out of range 0..{Z-1}")
-
-        compressed_latents = latents[:, EVAL_Z_IDX, :]  # [T, latent_dim]
-        print(f"\nSaving compressed latent timeseries for z={EVAL_Z_IDX} to {COMPRESSED_LATENTS_PATH}")
-        np.save(COMPRESSED_LATENTS_PATH, compressed_latents)
-
-        # AE-conditioned implicit model
+        # AE-conditioned implicit training
         train_ds_ae = make_training_dataset_ae_impl(
-            data_norm, coord_info, latents, crop_hw,
+            data_norm, coord_info, latents,
             batch_size=BATCH_SIZE_AE_IMPL
         )
         val_ds_ae = make_validation_dataset_ae_impl(
-            data_norm, coord_info, latents, crop_hw,
+            data_norm, coord_info, latents,
             num_samples=VAL_SAMPLES_AE_IMPL,
             batch_size=BATCH_SIZE_AE_IMPL
         )
 
         ae_impl_model = build_ae_implicit_model(latent_dim)
-        ae_impl_model.compile(optimizer=tf.keras.optimizers.Adam(1e-3), loss='mse')
+        ae_impl_model.compile(
+            optimizer=tf.keras.optimizers.Adam(1e-3),
+            loss='mse'
+        )
         ae_impl_model.summary()
 
         lr_sched2 = tf.keras.callbacks.ReduceLROnPlateau(
@@ -551,21 +635,26 @@ def main():
             callbacks=[lr_sched2],
             verbose=1
         )
+    else:
+        ae_impl_model = None
+        latents = None
 
-        # ----- Save AE-conditioned implicit model -----
-        print(f"\nSaving AE-conditioned implicit model to {AE_IMPL_MODEL_PATH}")
-        ae_impl_model.save(AE_IMPL_MODEL_PATH)
+    # ---------- Evaluation / comparison ----------
+    t_idx = EVAL_T_IDX
+    z_idx = EVAL_Z_IDX
+    print(f"\nEvaluating slice t={t_idx}, z={z_idx} ...")
 
-        # Small sanity check on one slice (optional)
-        gt, pred = evaluate_slice_ae_impl(
-            ae_impl_model, data_norm, coord_info, latents, crop_hw,
-            EVAL_T_IDX, EVAL_Z_IDX
-        )
-        mse = float(np.mean((pred - gt)**2))
-        print(f"\nAE-cond implicit sanity check slice (t={EVAL_T_IDX}, z={EVAL_Z_IDX}): "
-              f"MSE={mse:.3e}, PSNR={psnr(mse):.1f} dB")
+    gt = data_norm[t_idx, z_idx]
 
-    print("\nDone training and saving.")
+    pred_dir = None
+    if direct_model is not None:
+        _, pred_dir = evaluate_slice_direct(direct_model, data_norm, coord_info, t_idx, z_idx)
+
+    pred_ae = None
+    if ae_impl_model is not None:
+        _, pred_ae = evaluate_slice_ae_impl(ae_impl_model, data_norm, coord_info, latents, t_idx, z_idx)
+
+    plot_three_way(gt, pred_dir, pred_ae, coord_info, title_suffix=f"(t={t_idx}, z={z_idx})")
 
 
 if __name__ == "__main__":

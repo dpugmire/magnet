@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 import os
+from pathlib import Path
+
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
 
 # Paths must match those in train_and_encode.py
-DATA_FILE = "data/xcompact-TG.npy"
-MODEL_DIR = "saved_models"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+DATA_FILE = REPO_ROOT / "data" / "xcompact-TG.npy"
+MODEL_DIR = REPO_ROOT / "saved_models"
 
 AE_IMPL_MODEL_PATH      = os.path.join(MODEL_DIR, "ae_implicit.keras")
 COMPRESSED_LATENTS_PATH = os.path.join(MODEL_DIR, "compressed_latents_z3.npy")

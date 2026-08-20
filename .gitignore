@@ -1,3 +1,45 @@
-data
-saved_models
+# Local datasets and trained models
+data/
+saved_models/
+*.bp/
+*.keras
+*.npy
+*.npz
+*.pt
+*.pth
+*.vti
 
+# Generated experiment output
+runs/
+outputs/
+vtk_slices/
+vtk_volumes/
+/streamlines/human-guided-adaptive-simulation-campaigns*.png
+/topology/examples/
+
+# Python environments and caches
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+
+# Editor and operating-system state
+.DS_Store
+.vscode/
+*~
+\#*\#
+
+# Local working copies and historical snapshots
+/autoresearch/
+/BACKUP/
+/CAESAR/
+/CAESAR-OLD/
+/magnet/
+/magnet-OLD/
+/magnet-clean/
+/tmp/
+
+# Redundant legacy root document
+/README

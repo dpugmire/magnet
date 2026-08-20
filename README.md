@@ -20,7 +20,7 @@ outputs.
 
 ### Scalar neural implicit representations
 
-`train_and_encode.py` is the original TensorFlow pipeline for a scalar volume
+`scalar/train_and_encode.py` is the original TensorFlow pipeline for a scalar volume
 with shape `(time, z, y, x) = (200, 8, 129, 128)`. It compares two
 representations:
 
@@ -31,12 +31,12 @@ representations:
 The direct model uses gradient-based importance sampling to emphasize regions
 with high spatial variation. The autoencoder operates on cropped 128x128
 slices. Its latent grid is spatially averaged into an 8-value vector per slice,
-which conditions a coordinate MLP. `eval_from_compressed.py` loads this latent
-time series and implicit model to reconstruct fields and compare isocontours.
+which conditions a coordinate MLP. `scalar/eval_from_compressed.py` loads this
+latent time series and implicit model to reconstruct fields and compare
+isocontours.
 
-Several earlier scripts (`neural_implicit_model*.py`, `ae_contour*.py`, and
-`nerf*.py`) develop the same ideas on synthetic or progressively more realistic
-data.
+Earlier scripts under `scalar/prototypes/` develop the same ideas on synthetic
+or progressively more realistic data.
 
 ### Meshless rendering and contours
 
@@ -57,13 +57,14 @@ than a reusable contouring library.
 
 ### CAESAR latent representations
 
-`CAESAR/CAESAR` is a fork of CAESAR (*Conditional AutoEncoder with
+`external/CAESAR` pins a fork of CAESAR (*Conditional AutoEncoder with
 Super-resolution for Augmented Reduction*), a learned compressor for
 spatiotemporal scientific data. CAESAR-V combines an autoencoder, entropy model,
 scale hyperprior, and super-resolution decoder. CAESAR-D additionally uses
 conditional diffusion to interpolate missing latent frames.
 
-The MAGNET-specific experiments use CAESAR's quantized latent field in two ways:
+The MAGNET-specific scripts under `caesar_experiments/` use CAESAR's quantized
+latent field in two ways:
 
 - `train_latent_inr_and_decode.py` fits a 3D Fourier INR to a latent tensor,
   samples the INR back onto the latent grid, and sends the result through the
@@ -117,12 +118,13 @@ training.
 ## Repository organization
 
 ```text
-train_and_encode.py       Original scalar AE + INR training pipeline
-eval_from_compressed.py   Evaluation from saved per-slice latent vectors
+scalar/                   Scalar AE + INR pipeline and earlier prototypes
 meshless/                 Adaptive implicit rendering and contour experiments
-CAESAR/CAESAR/            CAESAR fork and MAGNET latent/rendering experiments
+caesar_experiments/       MAGNET experiments using CAESAR latent fields
+external/CAESAR/          Pinned CAESAR fork (Git submodule)
 streamlines/              ADIOS2 vector INR and streamline evaluation
 topology/                 AE reconstruction and persistent-homology evaluation
+tools/                    Small data-conversion utilities
 saved_models/             TensorFlow models and compressed latent arrays
 magnet*/                  Historical or nested MAGNET repository copies
 CAESAR-OLD/               Earlier CAESAR snapshot
@@ -135,10 +137,9 @@ PyTorch/ADIOS2 workflows, Gudhi topology code, and CUDA-oriented CAESAR fork use
 separate environments and assumptions. There is currently no integrated test
 suite.
 
-Most recent research directories and generated artifacts are untracked in the
-outer Git repository, and several subdirectories contain their own Git
-repositories. Check repository boundaries before committing or reorganizing
-files.
+Generated artifacts and historical working copies are excluded from the main
+repository. CAESAR remains an independent repository and is incorporated
+through a pinned Git submodule.
 
 ## Interpretation and current limitations
 
