@@ -16,6 +16,7 @@ vtk_slices/
 vtk_volumes/
 /streamlines/human-guided-adaptive-simulation-campaigns*.png
 /topology/examples/
+/2d-slice/artifacts/
 
 # Python environments and caches
 __pycache__/
