@@ -3,7 +3,8 @@
 This directory develops direct 2D extraction from CAESAR's latent
 representation. Milestone 1 establishes the reference path: a precise plane
 convention, a NumPy trilinear oracle, CAESAR latent extraction, and reproducible
-reference artifacts. It does not train a slice decoder yet.
+reference artifacts. The initial Milestone 2 baseline trains a point-query MLP
+against one CAESAR block without reconstructing a dense volume at inference.
 
 The complete staged design is in [PLAN.md](PLAN.md).
 
@@ -78,3 +79,55 @@ The output directory contains:
 - `manifest.json`: source selection, model hash, parameters, shapes, and semantics
 
 Generated files under `2d-slice/artifacts/` are ignored by Git.
+
+## Point-query baseline
+
+The first direct decoder samples a local feature vector from `q_latent` using
+trilinear interpolation, concatenates normalized `(x,y,z)` coordinates and
+Fourier features, and maps that vector to one normalized scalar with an MLP.
+CAESAR's block scale and offset convert the prediction back to field units.
+
+Only `q_latent`, scale, and offset are decoder inputs. CAESAR's error-bounded
+postprocessing residual is not supplied to this baseline, although the full
+CAESAR reconstruction remains its training target. The reported slice-decoder
+error therefore includes any correction information that cannot be inferred
+from `q_latent`.
+
+This is deliberately a one-block overfit experiment. It proves that the direct
+query path and error accounting work before adding multi-volume train/validation
+splits. The target is the full CAESAR reconstruction. When the manifest's source
+archive is available, evaluation memory-maps ground truth directly from that raw
+archive; otherwise it falls back to the pipeline's pre-compression copy.
+
+Train on the eight-frame reference artifact created above:
+
+```sh
+source ~/venv/bin/activate
+cd /Users/dpn/proj/MAGNET
+
+python 2d-slice/train_point_decoder.py \
+  --artifact-dir 2d-slice/artifacts/test-section-00 \
+  --output-dir 2d-slice/artifacts/test-section-00/point-decoder \
+  --steps 2000 \
+  --batch-size 4 \
+  --train-resolution 32 \
+  --eval-resolution 128 \
+  --eval-planes 8 \
+  --orientation mixed \
+  --device cpu
+```
+
+For a quick pipeline check, use `--steps 10 --eval-planes 2`. The output is:
+
+- `point_decoder.pt`: model weights, architecture, normalization, and block metadata
+- `point_decoder_metrics.json`: compression, slice-decoder, and end-to-end errors
+- `point_decoder_example.npz`: one held-out raw/CAESAR/direct plane triplet
+
+The three error groups answer different questions:
+
+- `compression`: raw source plane versus full CAESAR reconstruction
+- `sliceDecoder`: full CAESAR reconstruction versus direct point-query result
+- `endToEnd`: raw source plane versus direct point-query result
+
+The recorded latency covers only direct slice inference. It intentionally does
+not include CAESAR compression, artifact loading, or disk I/O.

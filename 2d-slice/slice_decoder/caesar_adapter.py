@@ -497,7 +497,6 @@ def run_caesar_reference(
     """Run CAESAR-V and return original, reconstructed, and latent block data."""
 
     try:
-        import torch
         from torch.utils.data import DataLoader
         from CAESAR.compressor import CAESAR
         from dataset import ScientificDataset
