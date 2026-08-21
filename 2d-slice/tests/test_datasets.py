@@ -13,9 +13,15 @@ PROJECT_DIRECTORY = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_DIRECTORY))
 
 from slice_decoder.datasets import (  # noqa: E402
+    MultiBlockPlaneDataset,
     RandomPlaneDataset,
+    discover_reference_artifacts,
+    load_reference_collection,
     load_reference_block,
+    load_reference_blocks,
+    parse_index_specification,
     random_contained_plane,
+    split_reference_blocks,
 )
 from slice_decoder.geometry import sample_volume  # noqa: E402
 from slice_decoder.metrics import error_decomposition, field_error_metrics  # noqa: E402
@@ -70,6 +76,57 @@ def _write_artifact(directory: Path) -> tuple[np.ndarray, np.ndarray]:
     return raw, caesar
 
 
+def _write_multiblock_artifact(
+    directory: Path,
+    source_path: Path,
+    source_data: np.ndarray,
+    *,
+    section_index: int,
+) -> None:
+    directory.mkdir()
+    raw = source_data[0, section_index]
+    caesar = raw + 0.05 * (section_index + 1)
+    latent = np.empty((4, 4, 3, 3), dtype=np.float32)
+    latent[:, :2] = float(section_index * 10)
+    latent[:, 2:] = float(section_index * 10 + 1)
+    np.save(directory / "original.npy", raw.astype(np.float32))
+    np.save(directory / "caesar_reference.npy", caesar.astype(np.float32))
+    np.save(directory / "q_latent.npy", latent)
+    blocks = []
+    for block_index in range(2):
+        blocks.append(
+            {
+                "variableIndex": 0,
+                "sectionIndex": 0,
+                "startIndex": block_index * 8,
+                "endIndex": (block_index + 1) * 8,
+                "latentShape": [4, 2, 3, 3],
+                "scale": [2.0 + section_index],
+                "offset": [0.1 * block_index],
+            }
+        )
+    manifest = {
+        "frameStart": 0,
+        "frameEnd": 16,
+        "variableIndex": 0,
+        "sectionIndex": 0,
+        "axisSemantic": "spatial_z",
+        "blocks": blocks,
+        "sourceMetadata": {
+            "archive": str(source_path),
+            "selection": {
+                "variableIndex": 0,
+                "sectionIndex": section_index,
+                "frameStart": 0,
+                "frameEnd": 16,
+            },
+        },
+    }
+    (directory / "manifest.json").write_text(
+        json.dumps(manifest), encoding="utf-8"
+    )
+
+
 class ReferenceDatasetTests(unittest.TestCase):
     def test_load_reference_block_and_generate_deterministic_pair(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -121,6 +178,69 @@ class ReferenceDatasetTests(unittest.TestCase):
                 self.assertAlmostEqual(float(np.linalg.norm(plane.axis_u)), 1.0)
                 self.assertAlmostEqual(float(np.linalg.norm(plane.axis_v)), 1.0)
                 self.assertAlmostEqual(float(np.dot(plane.axis_u, plane.axis_v)), 0.0)
+
+    def test_collection_loading_and_source_section_splits(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_data = np.arange(
+                1 * 3 * 16 * 6 * 7, dtype=np.float64
+            ).reshape(1, 3, 16, 6, 7)
+            source_path = root / "source.npz"
+            np.savez(source_path, data=source_data)
+            artifact_directories = []
+            for section in range(3):
+                directory = root / f"section-{section:02d}"
+                _write_multiblock_artifact(
+                    directory,
+                    source_path,
+                    source_data,
+                    section_index=section,
+                )
+                artifact_directories.append(directory)
+
+            discovered = discover_reference_artifacts(artifact_roots=(root,))
+            self.assertEqual(
+                discovered, tuple(directory.resolve() for directory in artifact_directories)
+            )
+            self.assertEqual(len(load_reference_blocks(artifact_directories[0])), 2)
+            blocks = load_reference_collection(discovered)
+            self.assertEqual(len(blocks), 6)
+            self.assertEqual(blocks[1].source_frame_start, 8)
+            self.assertEqual(blocks[1].source_frame_end, 16)
+            self.assertEqual(blocks[2].source_section_index, 1)
+            np.testing.assert_array_equal(
+                blocks[2].raw_volume, source_data[0, 1, 0:8]
+            )
+            self.assertTrue(np.all(blocks[3].latent == 11.0))
+
+            split = split_reference_blocks(
+                blocks,
+                train_sections=parse_index_specification("0"),
+                validation_sections=parse_index_specification("1"),
+                test_sections=parse_index_specification("2"),
+            )
+            self.assertEqual(len(split.train), 2)
+            self.assertEqual(len(split.validation), 2)
+            self.assertEqual(len(split.test), 2)
+            with self.assertRaisesRegex(ValueError, "disjoint"):
+                split_reference_blocks(
+                    blocks,
+                    train_sections=(0, 1),
+                    validation_sections=(1,),
+                    test_sections=(2,),
+                )
+
+            dataset = MultiBlockPlaneDataset(
+                split.train,
+                sample_count=2,
+                height=5,
+                width=5,
+                seed=9,
+            )
+            self.assertEqual(int(dataset[0]["block_position"]), 0)
+            self.assertEqual(int(dataset[1]["block_position"]), 1)
+            self.assertTrue(np.all(dataset[0]["latent"] == 0.0))
+            self.assertTrue(np.all(dataset[1]["latent"] == 1.0))
 
 
 class MetricTests(unittest.TestCase):
