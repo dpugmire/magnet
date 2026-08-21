@@ -105,6 +105,81 @@ class PlaneDecoderTests(unittest.TestCase):
         points = torch.stack((x, y, torch.zeros_like(x)), dim=-1)
         output = model(latent, points.repeat(3, 1, 1, 1))
         self.assertEqual(output.shape, (3, 1, 16, 16))
+        features = model.forward_features(latent, points.repeat(3, 1, 1, 1))
+        self.assertEqual(features.shape, (3, model.feature_channels, 16, 16))
+        torch.testing.assert_close(model.output_network[-1](features), output)
+        output.square().mean().backward()
+        self.assertTrue(
+            all(parameter.grad is not None for parameter in model.parameters())
+        )
+
+    def test_decoder_fuses_multiple_feature_volumes(self) -> None:
+        from slice_decoder.plane_decoder import (
+            PlaneConvolutionalDecoder,
+            PlaneDecoderConfig,
+        )
+
+        config = PlaneDecoderConfig(
+            latent_channels=5,
+            coarse_resolution=4,
+            output_resolution=8,
+            hidden_channels=8,
+            minimum_channels=4,
+            coarse_blocks=1,
+            positional_frequencies=1,
+        )
+        model = PlaneConvolutionalDecoder(config)
+        early = torch.randn(1, 2, 2, 3, 3)
+        late = torch.randn(1, 3, 4, 5, 5)
+        axis = torch.linspace(-1.0, 1.0, 8)
+        y, x = torch.meshgrid(axis, axis, indexing="ij")
+        points = torch.stack((x, y, torch.zeros_like(x)), dim=-1).unsqueeze(0)
+        output = model((early, late), points)
+        self.assertEqual(output.shape, (1, 1, 8, 8))
+        output.square().mean().backward()
+        self.assertTrue(
+            all(parameter.grad is not None for parameter in model.parameters())
+        )
+
+    def test_caesar_initialized_head_starts_with_identity_adapter(self) -> None:
+        from torch import nn
+
+        from slice_decoder.plane_decoder import (
+            CaesarInitializedPlaneDecoder,
+            PlaneDecoderConfig,
+        )
+
+        config = PlaneDecoderConfig(
+            latent_channels=32,
+            coarse_resolution=64,
+            output_resolution=128,
+            positional_frequencies=2,
+        )
+        super_resolution = nn.Sequential(
+            nn.Conv2d(32, 16, kernel_size=1),
+            nn.PixelShuffle(4),
+        )
+        model = CaesarInitializedPlaneDecoder(
+            config,
+            nn.Identity(),
+            super_resolution,
+        )
+        adapter = model.input_adapter
+        torch.testing.assert_close(
+            adapter.weight[:, :32, 0, 0],
+            torch.eye(32),
+        )
+        torch.testing.assert_close(
+            adapter.weight[:, 32:],
+            torch.zeros_like(adapter.weight[:, 32:]),
+        )
+
+        features = torch.randn(1, 32, 8, 64, 64)
+        axis = torch.linspace(-1.0, 1.0, 128)
+        y, x = torch.meshgrid(axis, axis, indexing="ij")
+        points = torch.stack((x, y, torch.zeros_like(x)), dim=-1).unsqueeze(0)
+        output = model(features, points)
+        self.assertEqual(output.shape, (1, 1, 128, 128))
         output.square().mean().backward()
         self.assertTrue(
             all(parameter.grad is not None for parameter in model.parameters())

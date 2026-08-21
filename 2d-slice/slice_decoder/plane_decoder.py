@@ -5,13 +5,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 import torch
 from torch import nn
 from torch.nn import functional
 
 from .point_decoder import positional_encoding
+
+
+PlaneFeatureInput = torch.Tensor | Sequence[torch.Tensor]
 
 
 @dataclass(frozen=True)
@@ -207,6 +210,69 @@ def sample_latent_plane_slab_features(
     )
 
 
+def _feature_volumes(features: PlaneFeatureInput) -> tuple[torch.Tensor, ...]:
+    volumes = (features,) if isinstance(features, torch.Tensor) else tuple(features)
+    if not volumes:
+        raise ValueError("at least one feature volume is required")
+    devices = {volume.device for volume in volumes}
+    if len(devices) != 1:
+        raise ValueError(f"feature volumes must use one device, got {devices}")
+    return volumes
+
+
+def _sample_plane_feature_map(
+    features: PlaneFeatureInput,
+    points: torch.Tensor,
+    config: PlaneDecoderConfig,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if points.ndim == 3:
+        points = points.unsqueeze(0)
+    if points.ndim != 4 or points.shape[-1] != 3:
+        raise ValueError(f"points must be [B,H,W,3], got {points.shape}")
+    expected_shape = (config.output_resolution, config.output_resolution)
+    if points.shape[1:3] != expected_shape:
+        raise ValueError(
+            f"point grid must be {expected_shape}, got {points.shape[1:3]}"
+        )
+
+    volumes = _feature_volumes(features)
+    total_channels = sum(int(volume.shape[-4]) for volume in volumes)
+    if total_channels != config.latent_channels:
+        raise ValueError(
+            f"feature volumes provide {total_channels} channels, expected "
+            f"{config.latent_channels}"
+        )
+
+    point_channels = points.permute(0, 3, 1, 2)
+    coarse_point_channels = functional.interpolate(
+        point_channels,
+        size=(config.coarse_resolution, config.coarse_resolution),
+        mode="bilinear",
+        align_corners=True,
+    )
+    coarse_points = coarse_point_channels.permute(0, 2, 3, 1)
+    sampling_points = coarse_points.to(volumes[0].device)
+    axis_u = sampling_points[:, 0, -1] - sampling_points[:, 0, 0]
+    axis_v = sampling_points[:, -1, 0] - sampling_points[:, 0, 0]
+    normals = torch.linalg.cross(axis_u, axis_v, dim=-1)
+    sampled = [
+        sample_latent_plane_slab_features(
+            volume,
+            sampling_points,
+            normals,
+            sample_count=config.slab_samples,
+            radius_cells=config.slab_radius_cells,
+        )
+        for volume in volumes
+    ]
+    latent_features = torch.cat(sampled, dim=1).to(coarse_points.device)
+    coordinate_features = positional_encoding(
+        coarse_points,
+        config.positional_frequencies,
+    ).permute(0, 3, 1, 2)
+    return latent_features, coordinate_features
+
+
 class _ResidualBlock(nn.Module):
     def __init__(self, channels: int) -> None:
         super().__init__()
@@ -276,60 +342,105 @@ class PlaneConvolutionalDecoder(nn.Module):
             nn.Conv2d(current_channels, 1, kernel_size=1),
         )
 
-    def forward(self, latent: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
-        if points.ndim == 3:
-            points = points.unsqueeze(0)
-        if points.ndim != 4 or points.shape[-1] != 3:
-            raise ValueError(f"points must be [B,H,W,3], got {points.shape}")
-        expected_shape = (
-            self.config.output_resolution,
-            self.config.output_resolution,
-        )
-        if points.shape[1:3] != expected_shape:
-            raise ValueError(
-                f"point grid must be {expected_shape}, got {points.shape[1:3]}"
-            )
+    @property
+    def feature_channels(self) -> int:
+        """Number of channels in the final spatial decoder feature map."""
 
-        point_channels = points.permute(0, 3, 1, 2)
-        coarse_point_channels = functional.interpolate(
-            point_channels,
-            size=(self.config.coarse_resolution, self.config.coarse_resolution),
-            mode="bilinear",
-            align_corners=True,
-        )
-        coarse_points = coarse_point_channels.permute(0, 2, 3, 1)
-        axis_u = coarse_points[:, 0, -1] - coarse_points[:, 0, 0]
-        axis_v = coarse_points[:, -1, 0] - coarse_points[:, 0, 0]
-        normals = torch.linalg.cross(axis_u, axis_v, dim=-1)
-        latent_features = sample_latent_plane_slab_features(
+        scalar_projection = self.output_network[-1]
+        if not isinstance(scalar_projection, nn.Conv2d):
+            raise RuntimeError("unexpected plane-decoder output network")
+        return int(scalar_projection.in_channels)
+
+    def forward_features(
+        self,
+        latent: PlaneFeatureInput,
+        points: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return the final 2D feature map immediately before scalar projection."""
+
+        latent_features, coordinate_features = _sample_plane_feature_map(
             latent,
-            coarse_points,
-            normals,
-            sample_count=self.config.slab_samples,
-            radius_cells=self.config.slab_radius_cells,
+            points,
+            self.config,
         )
-        coordinate_features = positional_encoding(
-            coarse_points,
-            self.config.positional_frequencies,
-        ).permute(0, 3, 1, 2)
         values = self.coarse_network(
             torch.cat((latent_features, coordinate_features), dim=1)
         )
         values = self.upsample_network(values)
-        return self.output_network(values)
+        return self.output_network[:-1](values)
+
+    def forward(self, latent: PlaneFeatureInput, points: torch.Tensor) -> torch.Tensor:
+        return self.output_network[-1](self.forward_features(latent, points))
+
+
+class CaesarInitializedPlaneDecoder(nn.Module):
+    """Fine-tunable plane head initialized from CAESAR's final 2D decoder."""
+
+    def __init__(
+        self,
+        config: PlaneDecoderConfig,
+        caesar_stage: nn.Module,
+        super_resolution: nn.Module,
+    ) -> None:
+        super().__init__()
+        if config.latent_channels != 32:
+            raise ValueError("CAESAR-initialized heads require 32 late features")
+        if config.coarse_resolution != 64:
+            raise ValueError("CAESAR-initialized heads require a 64x64 feature map")
+        if config.slab_samples != 1:
+            raise ValueError("CAESAR-initialized heads require one sampled plane")
+        self.config = config
+        input_channels = config.latent_channels + config.coordinate_channels
+        self.input_adapter = nn.Conv2d(input_channels, 32, kernel_size=1)
+        with torch.no_grad():
+            self.input_adapter.weight.zero_()
+            self.input_adapter.bias.zero_()
+            identity = torch.eye(32).reshape(32, 32, 1, 1)
+            self.input_adapter.weight[:, :32].copy_(identity)
+        self.caesar_stage = caesar_stage
+        self.super_resolution = super_resolution
+        for parameter in self.parameters():
+            parameter.requires_grad_(True)
+
+    def forward(self, latent: PlaneFeatureInput, points: torch.Tensor) -> torch.Tensor:
+        latent_features, coordinate_features = _sample_plane_feature_map(
+            latent,
+            points,
+            self.config,
+        )
+        values = self.input_adapter(
+            torch.cat((latent_features, coordinate_features), dim=1)
+        )
+        values = self.caesar_stage(values)
+        values = self.super_resolution(values)
+        expected_shape = (self.config.output_resolution,) * 2
+        if values.shape[-2:] != expected_shape:
+            values = functional.interpolate(
+                values,
+                size=expected_shape,
+                mode="bilinear",
+                align_corners=True,
+            )
+        return values
 
 
 def save_plane_decoder_checkpoint(
     path: str | Path,
-    model: PlaneConvolutionalDecoder,
+    model: PlaneConvolutionalDecoder | CaesarInitializedPlaneDecoder,
     *,
     metadata: dict[str, Any],
 ) -> Path:
     checkpoint_path = Path(path).expanduser().resolve()
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    model_type = (
+        "caesar-initialized"
+        if isinstance(model, CaesarInitializedPlaneDecoder)
+        else "convolutional"
+    )
     torch.save(
         {
-            "formatVersion": 1,
+            "formatVersion": 2,
+            "modelType": model_type,
             "modelConfig": model.config.to_dict(),
             "modelState": model.state_dict(),
             "metadata": metadata,
@@ -343,15 +454,39 @@ def load_plane_decoder_checkpoint(
     path: str | Path,
     *,
     device: str | torch.device = "cpu",
-) -> tuple[PlaneConvolutionalDecoder, dict[str, Any]]:
+) -> tuple[
+    PlaneConvolutionalDecoder | CaesarInitializedPlaneDecoder,
+    dict[str, Any],
+]:
     checkpoint = torch.load(
         Path(path).expanduser().resolve(),
         map_location=device,
         weights_only=False,
     )
-    if int(checkpoint.get("formatVersion", 0)) != 1:
+    format_version = int(checkpoint.get("formatVersion", 0))
+    if format_version not in {1, 2}:
         raise ValueError("unsupported plane-decoder checkpoint format")
     config = PlaneDecoderConfig(**checkpoint["modelConfig"])
-    model = PlaneConvolutionalDecoder(config).to(device)
+    model_type = checkpoint.get("modelType", "convolutional")
+    metadata = dict(checkpoint.get("metadata", {}))
+    if model_type == "convolutional":
+        model: PlaneConvolutionalDecoder | CaesarInitializedPlaneDecoder
+        model = PlaneConvolutionalDecoder(config)
+    elif model_type == "caesar-initialized":
+        caesar_model = metadata.get("caesarModel")
+        if not caesar_model:
+            raise ValueError("CAESAR-initialized checkpoint has no caesarModel")
+        from .caesar_features import FrozenCaesarVFeatureDecoder
+
+        feature_decoder = FrozenCaesarVFeatureDecoder(caesar_model, device="cpu")
+        caesar_stage, super_resolution = feature_decoder.copy_downstream_2d_decoder()
+        model = CaesarInitializedPlaneDecoder(
+            config,
+            caesar_stage,
+            super_resolution,
+        )
+    else:
+        raise ValueError(f"unsupported plane-decoder model type {model_type!r}")
+    model = model.to(device)
     model.load_state_dict(checkpoint["modelState"])
-    return model, dict(checkpoint.get("metadata", {}))
+    return model, metadata

@@ -4,15 +4,20 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import random
 import time
-from typing import Sequence
+from typing import Callable, Sequence
 
 import numpy as np
 import torch
 
+from slice_decoder.caesar_features import (
+    FrozenCaesarVFeatureDecoder,
+    caesar_feature_tap_metadata,
+)
 from slice_decoder.datasets import (
     MultiBlockPlaneDataset,
     ReferenceBlock,
@@ -23,6 +28,8 @@ from slice_decoder.datasets import (
 )
 from slice_decoder.metrics import plane_decoder_error_decomposition
 from slice_decoder.plane_decoder import (
+    CaesarInitializedPlaneDecoder,
+    PlaneFeatureInput,
     PlaneConvolutionalDecoder,
     PlaneDecoderConfig,
     save_plane_decoder_checkpoint,
@@ -79,7 +86,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--steps", type=_positive_integer, default=10_000)
     parser.add_argument("--batch-size", type=_positive_integer, default=2)
     parser.add_argument("--resolution", type=_positive_integer, default=128)
-    parser.add_argument("--coarse-resolution", type=_positive_integer, default=16)
+    parser.add_argument(
+        "--coarse-resolution",
+        type=_positive_integer,
+        default=None,
+        help="Defaults to 16 for q_latent or the selected feature-tap resolution",
+    )
     parser.add_argument("--eval-planes", type=_positive_integer, default=8)
     parser.add_argument("--hidden-channels", type=_positive_integer, default=64)
     parser.add_argument("--minimum-channels", type=_positive_integer, default=16)
@@ -90,8 +102,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--slab-samples",
         type=_positive_integer,
-        default=5,
-        help="Odd number of parallel latent planes to concatenate",
+        default=None,
+        help="Defaults to five for q_latent or one for contextual features",
     )
     parser.add_argument(
         "--slab-radius-cells",
@@ -102,6 +114,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--weight-decay", type=float, default=1.0e-6)
     parser.add_argument(
+        "--gradient-clip-norm",
+        type=float,
+        default=None,
+        help="Optional maximum L2 gradient norm",
+    )
+    parser.add_argument(
         "--orientation",
         choices=("axis-aligned", "random", "mixed"),
         default="mixed",
@@ -109,6 +127,28 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--maximum-offset", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--caesar-model",
+        type=Path,
+        default=None,
+        help="CAESAR-V checkpoint used for a frozen contextual feature tap",
+    )
+    parser.add_argument(
+        "--feature-tap",
+        choices=("early", "late", "early-late"),
+        default=None,
+    )
+    parser.add_argument(
+        "--head-initialization",
+        choices=("random", "caesar"),
+        default="random",
+        help="Use the custom random head or initialize from CAESAR's final 2D decoder",
+    )
+    parser.add_argument(
+        "--context-device",
+        default=None,
+        help="Frozen CAESAR device; defaults to CPU for MPS, otherwise --device",
+    )
     parser.add_argument("--log-interval", type=_positive_integer, default=100)
     return parser
 
@@ -118,6 +158,22 @@ def _synchronize(device: torch.device) -> None:
         torch.cuda.synchronize(device)
     elif device.type == "mps" and hasattr(torch, "mps"):
         torch.mps.synchronize()
+
+
+def _synchronize_devices(*devices: torch.device) -> None:
+    synchronized: set[str] = set()
+    for device in devices:
+        if str(device) not in synchronized:
+            _synchronize(device)
+            synchronized.add(str(device))
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _numpy_batch(
@@ -213,12 +269,15 @@ def _block_summary(blocks: Sequence[ReferenceBlock]) -> dict[str, object]:
 
 
 def evaluate_plane_decoder(
-    model: PlaneConvolutionalDecoder,
+    model: PlaneConvolutionalDecoder | CaesarInitializedPlaneDecoder,
     dataset: MultiBlockPlaneDataset,
     *,
     device: torch.device,
     output_directory: Path,
     split_name: str,
+    prepare_latent: Callable[[torch.Tensor], PlaneFeatureInput] | None = None,
+    context_device: torch.device | None = None,
+    inference_scope: str = "plane decoder only",
 ) -> dict[str, object]:
     model.eval()
     raw_fields: list[np.ndarray] = []
@@ -232,15 +291,23 @@ def evaluate_plane_decoder(
         for index in range(len(dataset)):
             sample = dataset[index]
             latent = torch.from_numpy(np.array(sample["latent"], copy=True))
-            latent = latent.unsqueeze(0).to(device)
+            latent = latent.unsqueeze(0)
             points = torch.from_numpy(sample["points"])
             points = points.reshape(1, dataset.height, dataset.width, 3).to(device)
             if index == 0:
-                model(latent, points)
-                _synchronize(device)
+                warm_input = (
+                    latent.to(device)
+                    if prepare_latent is None
+                    else prepare_latent(latent)
+                )
+                model(warm_input, points)
+                _synchronize_devices(device, context_device or device)
             start_time = time.perf_counter()
-            prediction_normalized = model(latent, points)
-            _synchronize(device)
+            model_input = (
+                latent.to(device) if prepare_latent is None else prepare_latent(latent)
+            )
+            prediction_normalized = model(model_input, points)
+            _synchronize_devices(device, context_device or device)
             latencies.append((time.perf_counter() - start_time) * 1000.0)
 
             scale = float(sample["scale"])
@@ -313,7 +380,8 @@ def evaluate_plane_decoder(
             "outputShape": [dataset.height, dataset.width],
             "planeCount": len(dataset),
             "device": str(device),
-            "scope": "plane decoder only; excludes CAESAR compression and disk I/O",
+            "contextDevice": str(context_device or device),
+            "scope": f"{inference_scope}; excludes CAESAR compression and disk I/O",
         },
     }
 
@@ -324,6 +392,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("learning rate must be positive")
     if args.weight_decay < 0.0:
         raise ValueError("weight decay must be nonnegative")
+    if args.gradient_clip_norm is not None and args.gradient_clip_norm <= 0.0:
+        raise ValueError("gradient clip norm must be positive")
     if not 0.0 <= args.maximum_offset < 1.0:
         raise ValueError("maximum offset must be in [0,1)")
 
@@ -342,18 +412,90 @@ def main(argv: Sequence[str] | None = None) -> int:
         split_mode,
     ) = _resolve_block_sets(args)
     block = train_blocks[0]
+    contextual = args.caesar_model is not None or args.feature_tap is not None
+    if contextual and (args.caesar_model is None or args.feature_tap is None):
+        raise ValueError("--caesar-model and --feature-tap must be specified together")
+    if args.context_device is not None:
+        context_device = torch.device(args.context_device)
+    elif contextual and device.type == "mps":
+        context_device = torch.device("cpu")
+    else:
+        context_device = device
+
+    feature_decoder: FrozenCaesarVFeatureDecoder | None = None
+    caesar_model_path: Path | None = None
+    feature_tap: str | None = None
+    if contextual:
+        caesar_model_path = args.caesar_model.expanduser().resolve()
+        feature_tap = args.feature_tap
+        feature_decoder = FrozenCaesarVFeatureDecoder(
+            caesar_model_path,
+            device=context_device,
+        )
+        if feature_tap == "early-late":
+            early_metadata = caesar_feature_tap_metadata("early")
+            late_metadata = caesar_feature_tap_metadata("late")
+            latent_channels = early_metadata.channels + late_metadata.channels
+            default_coarse_resolution = late_metadata.width
+        else:
+            tap_metadata = caesar_feature_tap_metadata(feature_tap)
+            latent_channels = tap_metadata.channels
+            default_coarse_resolution = tap_metadata.width
+        coarse_resolution = args.coarse_resolution or default_coarse_resolution
+        slab_samples = args.slab_samples or 1
+        input_representation = f"caesar-{feature_tap}-features"
+        inference_scope = (
+            f"frozen CAESAR {feature_tap} feature extraction plus "
+            f"{args.head_initialization}-initialized plane head"
+        )
+    else:
+        latent_channels = int(block.latent.shape[0])
+        coarse_resolution = args.coarse_resolution or 16
+        slab_samples = args.slab_samples or 5
+        input_representation = "q_latent"
+        inference_scope = "plane decoder only"
+
+    if args.head_initialization == "caesar" and (
+        not contextual or feature_tap != "late"
+    ):
+        raise ValueError(
+            "--head-initialization caesar requires --feature-tap late and "
+            "--caesar-model"
+        )
+
+    def prepare_latent(latent: torch.Tensor) -> PlaneFeatureInput:
+        if feature_decoder is None or feature_tap is None:
+            return latent.to(device)
+        if feature_tap == "early-late":
+            early, late = feature_decoder.extract_taps(latent.to(context_device))
+            if late is None:
+                raise RuntimeError("late CAESAR features were not extracted")
+            return early, late
+        return feature_decoder.extract(latent.to(context_device), feature_tap)
+
     config = PlaneDecoderConfig(
-        latent_channels=int(block.latent.shape[0]),
-        coarse_resolution=args.coarse_resolution,
+        latent_channels=latent_channels,
+        coarse_resolution=coarse_resolution,
         output_resolution=args.resolution,
         hidden_channels=args.hidden_channels,
         minimum_channels=args.minimum_channels,
         coarse_blocks=args.coarse_blocks,
         positional_frequencies=args.positional_frequencies,
-        slab_samples=args.slab_samples,
+        slab_samples=slab_samples,
         slab_radius_cells=args.slab_radius_cells,
     )
-    model = PlaneConvolutionalDecoder(config).to(device)
+    if args.head_initialization == "caesar":
+        if feature_decoder is None:
+            raise RuntimeError("CAESAR feature decoder was not initialized")
+        caesar_stage, super_resolution = feature_decoder.copy_downstream_2d_decoder()
+        model: PlaneConvolutionalDecoder | CaesarInitializedPlaneDecoder
+        model = CaesarInitializedPlaneDecoder(
+            config,
+            caesar_stage,
+            super_resolution,
+        ).to(device)
+    else:
+        model = PlaneConvolutionalDecoder(config).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.learning_rate,
@@ -377,7 +519,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     model.train()
     for step in range(args.steps):
         batch = _numpy_batch(train_dataset, step * args.batch_size, args.batch_size)
-        latent = torch.from_numpy(batch["latent"]).to(device)
+        latent = prepare_latent(torch.from_numpy(batch["latent"]))
         points = torch.from_numpy(batch["points"])
         points = points.reshape(
             args.batch_size,
@@ -398,9 +540,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         prediction = model(latent, points)
         loss = torch.mean((prediction - target) ** 2)
+        if not bool(torch.isfinite(loss)):
+            raise FloatingPointError(f"non-finite training loss at step {step + 1}")
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        if args.gradient_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=args.gradient_clip_norm,
+                error_if_nonfinite=True,
+            )
         optimizer.step()
 
         final_loss = float(loss.detach().cpu())
@@ -408,7 +558,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             first_loss = final_loss
         if step == 0 or (step + 1) % args.log_interval == 0 or step + 1 == args.steps:
             print(f"step {step + 1:6d}/{args.steps}: normalized MSE={final_loss:.8e}")
-    _synchronize(device)
+    _synchronize_devices(device, context_device)
     training_seconds = time.perf_counter() - start_training
 
     checkpoint_path = save_plane_decoder_checkpoint(
@@ -424,6 +574,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "target": "caesarBase",
             "seed": args.seed,
             "orientation": args.orientation,
+            "inputRepresentation": input_representation,
+            "featureTap": feature_tap,
+            "headInitialization": args.head_initialization,
+            "caesarModel": (
+                None if caesar_model_path is None else str(caesar_model_path)
+            ),
+            "caesarModelSha256": (
+                None if caesar_model_path is None else _sha256(caesar_model_path)
+            ),
         },
     )
 
@@ -453,6 +612,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=device,
         output_directory=output_directory,
         split_name="validation",
+        prepare_latent=prepare_latent,
+        context_device=context_device,
+        inference_scope=inference_scope,
     )
     test_results = evaluate_plane_decoder(
         model,
@@ -460,10 +622,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         device=device,
         output_directory=output_directory,
         split_name="test",
+        prepare_latent=prepare_latent,
+        context_device=context_device,
+        inference_scope=inference_scope,
     )
     results = {
-        "formatVersion": 1,
+        "formatVersion": 2 if contextual else 1,
         "target": "caesarBase",
+        "inputRepresentation": input_representation,
+        "headInitialization": args.head_initialization,
         "splitMode": split_mode,
         "validation": validation_results,
         "test": test_results,
@@ -477,6 +644,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "orientation": args.orientation,
             "maximumOffset": args.maximum_offset,
             "seed": args.seed,
+            "learningRate": args.learning_rate,
+            "weightDecay": args.weight_decay,
+            "gradientClipNorm": args.gradient_clip_norm,
         },
         "model": {
             **config.to_dict(),
@@ -484,6 +654,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 parameter.numel() for parameter in model.parameters()
             ),
             "checkpoint": str(checkpoint_path),
+            "frozenCaesarParameterCount": (
+                0
+                if feature_decoder is None
+                else sum(
+                    parameter.numel()
+                    for parameter in feature_decoder.caesar_model.parameters()
+                )
+            ),
         },
         "data": {
             "artifactDirectories": [str(path) for path in artifact_directories],
@@ -491,6 +669,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             "train": _block_summary(train_blocks),
             "validation": _block_summary(validation_blocks),
             "test": _block_summary(test_blocks),
+            "featureTap": feature_tap,
+            "headInitialization": args.head_initialization,
+            "caesarModel": (
+                None if caesar_model_path is None else str(caesar_model_path)
+            ),
+            "caesarModelSha256": (
+                None if caesar_model_path is None else _sha256(caesar_model_path)
+            ),
+            "contextDevice": str(context_device),
         },
     }
     metrics_path = output_directory / "plane_decoder_metrics.json"
