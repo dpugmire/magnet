@@ -15,6 +15,7 @@ sys.path.insert(0, str(PROJECT_DIRECTORY))
 from slice_decoder.caesar_adapter import (  # noqa: E402
     CaesarReference,
     LatentBlock,
+    decode_caesar_base_reconstruction,
     extract_latent_blocks,
     inspect_npz,
     open_stored_npz_array,
@@ -74,6 +75,38 @@ class ArchiveTests(unittest.TestCase):
 
 
 class LatentTests(unittest.TestCase):
+    def test_decode_base_reconstruction_skips_residual_postprocessing(self) -> None:
+        latent_batches = [{"compressed": "payload"}]
+        shape = (1, 1, 8, 4, 4)
+        decoded = np.full(shape, 2.0, dtype=np.float32)
+
+        class FakeCaesar:
+            use_diffusion = False
+
+            def decompress_caesar_v(self, latent, requested_shape, filtered):
+                self.arguments = (latent, requested_shape, filtered)
+                return decoded
+
+            def transform_shape(self, values):
+                return values + 1.0
+
+        class FakeDataset:
+            def recons_data(self, values):
+                return values[:, :, :6]
+
+        caesar = FakeCaesar()
+        result = decode_caesar_base_reconstruction(
+            caesar,
+            {
+                "latent": latent_batches,
+                "shape": shape,
+                "filtered_blocks": [(0, 0.0)],
+            },
+            FakeDataset(),
+        )
+        self.assertEqual(caesar.arguments, (latent_batches, shape, [(0, 0.0)]))
+        np.testing.assert_array_equal(result, np.full((1, 1, 6, 4, 4), 3.0))
+
     def test_extract_flattened_caesar_v_latents_and_stack(self) -> None:
         q_latent = np.arange(4 * 3 * 2 * 2, dtype=np.float32).reshape(4, 3, 2, 2)
         compressed = {
@@ -168,6 +201,8 @@ class LatentTests(unittest.TestCase):
             offset=np.array(-1.0),
         )
         volume = np.zeros((8, 12, 12), dtype=np.float32)
+        base = volume + 0.25
+        reconstructed = volume + 0.125
         with tempfile.TemporaryDirectory() as temporary_directory:
             directory = Path(temporary_directory)
             data_path = directory / "input.npz"
@@ -176,7 +211,8 @@ class LatentTests(unittest.TestCase):
             model_path.write_bytes(b"test checkpoint")
             reference = CaesarReference(
                 original=volume,
-                reconstructed=volume,
+                base_reconstructed=base,
+                reconstructed=reconstructed,
                 latent_blocks=(block,),
                 compressed_bytes=123.0,
                 source_data=data_path,
@@ -196,9 +232,18 @@ class LatentTests(unittest.TestCase):
                 source_metadata={"archive": "source.npz"},
             )
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            self.assertEqual(manifest["formatVersion"], 1)
+            self.assertEqual(manifest["formatVersion"], 2)
             self.assertEqual(manifest["latentShape"], [2, 2, 3, 3])
+            self.assertEqual(manifest["baseReconstructedShape"], [8, 12, 12])
+            self.assertAlmostEqual(manifest["stageMetrics"]["baseVsRaw"]["rmse"], 0.25)
             self.assertEqual(manifest["sourceMetadata"]["archive"], "source.npz")
+            np.testing.assert_array_equal(
+                np.load(directory / "artifacts" / "caesar_base.npy"), base
+            )
+            np.testing.assert_array_equal(
+                np.load(directory / "artifacts" / "caesar_residual.npy"),
+                reconstructed - base,
+            )
 
 
 if __name__ == "__main__":

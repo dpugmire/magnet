@@ -132,6 +132,7 @@ class LatentVolume:
 @dataclass(frozen=True)
 class CaesarReference:
     original: np.ndarray
+    base_reconstructed: np.ndarray
     reconstructed: np.ndarray
     latent_blocks: tuple[LatentBlock, ...]
     compressed_bytes: float
@@ -146,15 +147,22 @@ class CaesarReference:
 
     def __post_init__(self) -> None:
         original = np.asarray(self.original)
+        base_reconstructed = np.asarray(self.base_reconstructed)
         reconstructed = np.asarray(self.reconstructed)
         if original.ndim != 3:
             raise ValueError(f"original volume must be [D,H,W], got {original.shape}")
+        if base_reconstructed.shape != original.shape:
+            raise ValueError(
+                "original and base-reconstructed shapes differ: "
+                f"{original.shape} vs {base_reconstructed.shape}"
+            )
         if reconstructed.shape != original.shape:
             raise ValueError(
                 "original and reconstructed shapes differ: "
                 f"{original.shape} vs {reconstructed.shape}"
             )
         object.__setattr__(self, "original", original.copy())
+        object.__setattr__(self, "base_reconstructed", base_reconstructed.copy())
         object.__setattr__(self, "reconstructed", reconstructed.copy())
 
 
@@ -196,7 +204,9 @@ def inspect_npz(path: str | Path) -> ArchiveMetadata:
             )
 
     variable_names: tuple[str, ...] = ()
-    names_entry = next((array for array in arrays if array.name == "variable_name"), None)
+    names_entry = next(
+        (array for array in arrays if array.name == "variable_name"), None
+    )
     if names_entry is not None and names_entry.uncompressed_bytes <= 1024 * 1024:
         with np.load(archive_path, allow_pickle=False) as archive:
             names = np.asarray(archive["variable_name"]).reshape(-1)
@@ -226,7 +236,9 @@ def _stored_member_data_offset(archive_path: Path, info: zipfile.ZipInfo) -> int
             raise ValueError(f"invalid ZIP local header for {info.filename}")
         filename_length = fields[-2]
         extra_length = fields[-1]
-        return info.header_offset + _ZIP_LOCAL_HEADER.size + filename_length + extra_length
+        return (
+            info.header_offset + _ZIP_LOCAL_HEADER.size + filename_length + extra_length
+        )
 
 
 def open_stored_npz_array(
@@ -281,7 +293,9 @@ def prepare_caesar_subset(
     if not 0 <= section_index < sections:
         raise ValueError(f"section_index must be in [0,{sections - 1}]")
     if frame_start < 0 or frame_end <= frame_start or frame_end > frames:
-        raise ValueError(f"frame range [{frame_start},{frame_end}) is invalid for T={frames}")
+        raise ValueError(
+            f"frame range [{frame_start},{frame_end}) is invalid for T={frames}"
+        )
 
     mapped = open_stored_npz_array(source_path, "data")
     selected = np.asarray(
@@ -350,7 +364,9 @@ def extract_latent_blocks(
 
         index_fields = batch["index"]
         if not isinstance(index_fields, Sequence) or len(index_fields) != 4:
-            raise ValueError("block index must contain variable, section, start, and end")
+            raise ValueError(
+                "block index must contain variable, section, start, and end"
+            )
         index_arrays = [_as_numpy(field).reshape(-1) for field in index_fields]
         batch_size = int(index_arrays[0].size)
         if batch_size == 0 or any(array.size != batch_size for array in index_arrays):
@@ -453,7 +469,9 @@ def stack_latent_depth(
     for block in selected:
         shape = (block.latent.shape[0], block.latent.shape[2], block.latent.shape[3])
         if shape != reference_shape:
-            raise ValueError(f"latent block shape mismatch: {shape} vs {reference_shape}")
+            raise ValueError(
+                f"latent block shape mismatch: {shape} vs {reference_shape}"
+            )
         if block.start_index != previous_end:
             raise ValueError(
                 f"latent blocks are not contiguous: expected {previous_end}, "
@@ -478,6 +496,65 @@ def _scalar_float(value: Any) -> float:
     if array.size != 1:
         raise ValueError(f"expected scalar value, got shape {array.shape}")
     return float(array.reshape(-1)[0])
+
+
+def decode_caesar_base_reconstruction(
+    caesar: Any,
+    compressed: Mapping[str, Any],
+    dataset: Any,
+) -> Any:
+    """Decode the neural CAESAR stage without residual postprocessing."""
+
+    shape = compressed["shape"]
+    filtered_blocks = compressed["filtered_blocks"]
+    if caesar.use_diffusion:
+        reconstructed = caesar.decompress_caesar_d(
+            compressed["latent"], shape, filtered_blocks
+        )
+    else:
+        reconstructed = caesar.decompress_caesar_v(
+            compressed["latent"], shape, filtered_blocks
+        )
+    reconstructed = caesar.transform_shape(reconstructed)
+    return dataset.recons_data(reconstructed)
+
+
+def _error_summary(
+    reference: np.ndarray,
+    candidate: np.ndarray,
+) -> dict[str, float]:
+    reference_values = np.asarray(reference)
+    candidate_values = np.asarray(candidate)
+    error = candidate_values - reference_values
+    squared_error_sum = float(np.sum(error * error, dtype=np.float64))
+    reference_squared_sum = float(
+        np.sum(reference_values * reference_values, dtype=np.float64)
+    )
+    rmse = float(np.sqrt(squared_error_sum / error.size))
+    value_range = float(np.ptp(reference_values))
+    return {
+        "rmse": rmse,
+        "rangeNormalizedRmse": rmse / value_range if value_range > 0.0 else 0.0,
+        "relativeL2": (
+            float(np.sqrt(squared_error_sum / reference_squared_sum))
+            if reference_squared_sum > 0.0
+            else 0.0
+        ),
+        "meanAbsoluteError": float(np.mean(np.abs(error), dtype=np.float64)),
+        "maximumAbsoluteError": float(np.max(np.abs(error))),
+    }
+
+
+def _array_summary(values: np.ndarray) -> dict[str, float]:
+    array = np.asarray(values)
+    return {
+        "minimum": float(np.min(array)),
+        "maximum": float(np.max(array)),
+        "mean": float(np.mean(array, dtype=np.float64)),
+        "rms": float(np.sqrt(np.mean(array * array, dtype=np.float64))),
+        "meanAbsolute": float(np.mean(np.abs(array), dtype=np.float64)),
+        "maximumAbsolute": float(np.max(np.abs(array))),
+    }
 
 
 def run_caesar_reference(
@@ -539,17 +616,22 @@ def run_caesar_reference(
         n_frame=n_frame,
     )
     compressed, compressed_size = caesar.compress(dataloader, eb=error_bound)
+    base_reconstructed = decode_caesar_base_reconstruction(caesar, compressed, dataset)
     reconstructed = dataset.recons_data(caesar.decompress(compressed))
     original = dataset.input_data()
 
     original_array = _as_numpy(original)
+    base_reconstructed_array = _as_numpy(base_reconstructed)
     reconstructed_array = _as_numpy(reconstructed)
     if original_array.shape[:2] != (1, 1):
-        raise ValueError(f"expected one variable and section, got {original_array.shape}")
+        raise ValueError(
+            f"expected one variable and section, got {original_array.shape}"
+        )
 
     blocks = extract_latent_blocks(compressed)
     return CaesarReference(
         original=original_array[0, 0],
+        base_reconstructed=base_reconstructed_array[0, 0],
         reconstructed=reconstructed_array[0, 0],
         latent_blocks=blocks,
         compressed_bytes=_scalar_float(compressed_size),
@@ -587,7 +669,16 @@ def save_caesar_reference(
     output = Path(output_directory).expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
     np.save(output / "original.npy", reference.original.astype(np.float32))
+    np.save(
+        output / "caesar_base.npy",
+        reference.base_reconstructed.astype(np.float32),
+    )
     np.save(output / "caesar_reference.npy", reference.reconstructed.astype(np.float32))
+    residual_correction = reference.reconstructed - reference.base_reconstructed
+    np.save(
+        output / "caesar_residual.npy",
+        residual_correction.astype(np.float32),
+    )
 
     latent_volume = stack_latent_depth(
         reference.latent_blocks,
@@ -597,7 +688,7 @@ def save_caesar_reference(
     np.save(output / "q_latent.npy", latent_volume.latent.astype(np.float32))
 
     manifest = {
-        "formatVersion": 1,
+        "formatVersion": 2,
         "sourceData": str(reference.source_data),
         "sourceDataBytes": reference.source_data.stat().st_size,
         "modelPath": str(reference.model_path),
@@ -611,7 +702,16 @@ def save_caesar_reference(
         "errorBound": reference.error_bound,
         "compressedBytes": reference.compressed_bytes,
         "originalShape": list(reference.original.shape),
+        "baseReconstructedShape": list(reference.base_reconstructed.shape),
         "reconstructedShape": list(reference.reconstructed.shape),
+        "residualShape": list(residual_correction.shape),
+        "stageMetrics": {
+            "baseVsRaw": _error_summary(
+                reference.original, reference.base_reconstructed
+            ),
+            "finalVsRaw": _error_summary(reference.original, reference.reconstructed),
+            "residualCorrection": _array_summary(residual_correction),
+        },
         "latentShape": list(latent_volume.latent.shape),
         "latentDepthDownsampling": latent_volume.depth_downsampling,
         "blocks": [block.to_dict() for block in reference.latent_blocks],

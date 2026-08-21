@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and evaluate the first direct CAESAR latent-to-slice baseline."""
+"""Train and evaluate a plane-aligned convolutional CAESAR decoder."""
 
 from __future__ import annotations
 
@@ -21,11 +21,11 @@ from slice_decoder.datasets import (
     parse_index_specification,
     split_reference_blocks,
 )
-from slice_decoder.metrics import error_decomposition, staged_error_decomposition
-from slice_decoder.point_decoder import (
-    PointDecoderConfig,
-    PointQueryDecoder,
-    save_point_decoder_checkpoint,
+from slice_decoder.metrics import plane_decoder_error_decomposition
+from slice_decoder.plane_decoder import (
+    PlaneConvolutionalDecoder,
+    PlaneDecoderConfig,
+    save_plane_decoder_checkpoint,
 )
 
 
@@ -45,28 +45,28 @@ def _nonnegative_integer(value: str) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train a point-query decoder on CAESAR reference blocks"
+        description="Train a plane-aligned convolutional decoder on CAESAR latents"
     )
     parser.add_argument(
         "--artifact-dir",
         type=Path,
         action="append",
         default=[],
-        help="Reference artifact directory; may be repeated",
+        help="Staged reference artifact directory; may be repeated",
     )
     parser.add_argument(
         "--artifact-root",
         type=Path,
         action="append",
         default=[],
-        help="Recursively discover reference artifacts; may be repeated",
+        help="Recursively discover staged artifacts; may be repeated",
     )
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--block-index",
         type=_nonnegative_integer,
         default=None,
-        help="Legacy one-artifact mode: restrict training to one block",
+        help="One-artifact smoke mode: restrict training to one block",
     )
     parser.add_argument("--train-sections", default=None)
     parser.add_argument("--validation-sections", default=None)
@@ -76,20 +76,28 @@ def _build_parser() -> argparse.ArgumentParser:
         choices=("spatial_z", "time", "unconfirmed"),
         default=None,
     )
-    parser.add_argument("--steps", type=_positive_integer, default=2000)
-    parser.add_argument("--batch-size", type=_positive_integer, default=4)
-    parser.add_argument("--train-resolution", type=_positive_integer, default=32)
-    parser.add_argument("--eval-resolution", type=_positive_integer, default=128)
-    parser.add_argument(
-        "--eval-planes",
-        type=_positive_integer,
-        default=8,
-        help="Evaluation planes per block",
-    )
-    parser.add_argument("--hidden-dimension", type=_positive_integer, default=128)
-    parser.add_argument("--hidden-layers", type=_positive_integer, default=4)
+    parser.add_argument("--steps", type=_positive_integer, default=10_000)
+    parser.add_argument("--batch-size", type=_positive_integer, default=2)
+    parser.add_argument("--resolution", type=_positive_integer, default=128)
+    parser.add_argument("--coarse-resolution", type=_positive_integer, default=16)
+    parser.add_argument("--eval-planes", type=_positive_integer, default=8)
+    parser.add_argument("--hidden-channels", type=_positive_integer, default=64)
+    parser.add_argument("--minimum-channels", type=_positive_integer, default=16)
+    parser.add_argument("--coarse-blocks", type=_positive_integer, default=2)
     parser.add_argument(
         "--positional-frequencies", type=_nonnegative_integer, default=4
+    )
+    parser.add_argument(
+        "--slab-samples",
+        type=_positive_integer,
+        default=5,
+        help="Odd number of parallel latent planes to concatenate",
+    )
+    parser.add_argument(
+        "--slab-radius-cells",
+        type=float,
+        default=1.0,
+        help="Half-width of the sampled slab in latent-grid cells",
     )
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
     parser.add_argument("--weight-decay", type=float, default=1.0e-6)
@@ -127,122 +135,6 @@ def _numpy_batch(
     }
 
 
-def evaluate_point_decoder(
-    model: PointQueryDecoder,
-    dataset: MultiBlockPlaneDataset,
-    *,
-    device: torch.device,
-    output_directory: Path,
-    split_name: str,
-) -> dict[str, object]:
-    model.eval()
-    raw_fields: list[np.ndarray] = []
-    base_fields: list[np.ndarray] = []
-    caesar_fields: list[np.ndarray] = []
-    direct_fields: list[np.ndarray] = []
-    latencies: list[float] = []
-    by_section: dict[int, dict[str, list[np.ndarray]]] = {}
-    staged = dataset.blocks[0].base_volume is not None
-
-    with torch.inference_mode():
-        for index in range(len(dataset)):
-            sample = dataset[index]
-            latent = torch.from_numpy(np.array(sample["latent"], copy=True))
-            latent = latent.unsqueeze(0).to(device)
-            points = torch.from_numpy(sample["points"]).unsqueeze(0).to(device)
-            if index == 0:
-                model(latent, points)
-                _synchronize(device)
-            start_time = time.perf_counter()
-            prediction_normalized = model(latent, points)
-            _synchronize(device)
-            latencies.append((time.perf_counter() - start_time) * 1000.0)
-
-            scale = float(sample["scale"])
-            offset = float(sample["offset"])
-            prediction = prediction_normalized[0, :, 0].detach().cpu().numpy()
-            prediction = prediction * scale + offset
-            raw = sample["raw_values"][:, 0]
-            base = sample["base_values"][:, 0] if staged else None
-            caesar = sample["caesar_values"][:, 0]
-            raw_fields.append(raw)
-            if base is not None:
-                base_fields.append(base)
-            caesar_fields.append(caesar)
-            direct_fields.append(prediction)
-            section = int(sample["source_section_index"])
-            section_fields = by_section.setdefault(
-                section,
-                {"raw": [], "base": [], "caesar": [], "direct": []},
-            )
-            section_fields["raw"].append(raw)
-            if base is not None:
-                section_fields["base"].append(base)
-            section_fields["caesar"].append(caesar)
-            section_fields["direct"].append(prediction)
-
-            if index == 0:
-                height, width = dataset.height, dataset.width
-                example = {
-                    "raw": raw.reshape(height, width),
-                    "caesar": caesar.reshape(height, width),
-                    "direct": prediction.reshape(height, width),
-                    "points": sample["points"].reshape(height, width, 3),
-                    "plane_origin": sample["plane_origin"],
-                    "plane_axis_u": sample["plane_axis_u"],
-                    "plane_axis_v": sample["plane_axis_v"],
-                    "plane_bounds": sample["plane_bounds"],
-                    "source_section_index": sample["source_section_index"],
-                    "source_frame_start": sample["source_frame_start"],
-                }
-                if base is not None:
-                    example["base"] = base.reshape(height, width)
-                    example["residual"] = sample["residual_values"].reshape(
-                        height, width
-                    )
-                np.savez(
-                    output_directory / f"{split_name}_point_decoder_example.npz",
-                    **example,
-                )
-
-    def decompose(fields: dict[str, list[np.ndarray]]) -> dict[str, object]:
-        raw = np.concatenate(fields["raw"])
-        caesar = np.concatenate(fields["caesar"])
-        direct = np.concatenate(fields["direct"])
-        if staged:
-            return staged_error_decomposition(
-                raw,
-                np.concatenate(fields["base"]),
-                caesar,
-                direct,
-            )
-        return error_decomposition(raw, caesar, direct)
-
-    aggregate_fields = {
-        "raw": raw_fields,
-        "base": base_fields,
-        "caesar": caesar_fields,
-        "direct": direct_fields,
-    }
-    section_metrics = {
-        str(section): decompose(fields)
-        for section, fields in sorted(by_section.items())
-    }
-    return {
-        "aggregate": decompose(aggregate_fields),
-        "bySection": section_metrics,
-        "directInference": {
-            "meanMillisecondsPerSlice": float(np.mean(latencies)),
-            "medianMillisecondsPerSlice": float(np.median(latencies)),
-            "p95MillisecondsPerSlice": float(np.percentile(latencies, 95.0)),
-            "outputShape": [dataset.height, dataset.width],
-            "planeCount": len(dataset),
-            "device": str(device),
-            "scope": "point decoder only; excludes CAESAR compression and disk I/O",
-        },
-    }
-
-
 def _resolve_block_sets(
     args: argparse.Namespace,
 ) -> tuple[
@@ -275,6 +167,11 @@ def _resolve_block_sets(
         raise ValueError(
             f"expected axis semantic {args.expected_axis_semantic!r}, "
             f"found {next(iter(semantics))!r}"
+        )
+    if any(block.base_volume is None for block in all_blocks):
+        raise ValueError(
+            "plane-decoder training requires staged artifacts containing "
+            "caesar_base.npy"
         )
 
     split_arguments = (
@@ -315,6 +212,112 @@ def _block_summary(blocks: Sequence[ReferenceBlock]) -> dict[str, object]:
     }
 
 
+def evaluate_plane_decoder(
+    model: PlaneConvolutionalDecoder,
+    dataset: MultiBlockPlaneDataset,
+    *,
+    device: torch.device,
+    output_directory: Path,
+    split_name: str,
+) -> dict[str, object]:
+    model.eval()
+    raw_fields: list[np.ndarray] = []
+    base_fields: list[np.ndarray] = []
+    caesar_fields: list[np.ndarray] = []
+    plane_fields: list[np.ndarray] = []
+    latencies: list[float] = []
+    by_section: dict[int, dict[str, list[np.ndarray]]] = {}
+
+    with torch.inference_mode():
+        for index in range(len(dataset)):
+            sample = dataset[index]
+            latent = torch.from_numpy(np.array(sample["latent"], copy=True))
+            latent = latent.unsqueeze(0).to(device)
+            points = torch.from_numpy(sample["points"])
+            points = points.reshape(1, dataset.height, dataset.width, 3).to(device)
+            if index == 0:
+                model(latent, points)
+                _synchronize(device)
+            start_time = time.perf_counter()
+            prediction_normalized = model(latent, points)
+            _synchronize(device)
+            latencies.append((time.perf_counter() - start_time) * 1000.0)
+
+            scale = float(sample["scale"])
+            offset = float(sample["offset"])
+            prediction = prediction_normalized[0, 0].detach().cpu().numpy()
+            prediction = prediction * scale + offset
+            raw = sample["raw_values"][:, 0].reshape(dataset.height, dataset.width)
+            base = sample["base_values"][:, 0].reshape(dataset.height, dataset.width)
+            caesar = sample["caesar_values"][:, 0].reshape(
+                dataset.height, dataset.width
+            )
+            raw_fields.append(raw)
+            base_fields.append(base)
+            caesar_fields.append(caesar)
+            plane_fields.append(prediction)
+
+            section = int(sample["source_section_index"])
+            fields = by_section.setdefault(
+                section,
+                {"raw": [], "base": [], "caesar": [], "plane": []},
+            )
+            fields["raw"].append(raw)
+            fields["base"].append(base)
+            fields["caesar"].append(caesar)
+            fields["plane"].append(prediction)
+
+            if index == 0:
+                np.savez(
+                    output_directory / f"{split_name}_plane_decoder_example.npz",
+                    raw=raw,
+                    base=base,
+                    caesar=caesar,
+                    plane=prediction,
+                    residual=sample["residual_values"][:, 0].reshape(
+                        dataset.height, dataset.width
+                    ),
+                    points=sample["points"].reshape(dataset.height, dataset.width, 3),
+                    plane_origin=sample["plane_origin"],
+                    plane_axis_u=sample["plane_axis_u"],
+                    plane_axis_v=sample["plane_axis_v"],
+                    plane_bounds=sample["plane_bounds"],
+                    source_section_index=sample["source_section_index"],
+                    source_frame_start=sample["source_frame_start"],
+                )
+
+    def decompose(fields: dict[str, list[np.ndarray]]) -> dict[str, object]:
+        return plane_decoder_error_decomposition(
+            np.concatenate([values.reshape(-1) for values in fields["raw"]]),
+            np.concatenate([values.reshape(-1) for values in fields["base"]]),
+            np.concatenate([values.reshape(-1) for values in fields["caesar"]]),
+            np.concatenate([values.reshape(-1) for values in fields["plane"]]),
+        )
+
+    aggregate_fields = {
+        "raw": raw_fields,
+        "base": base_fields,
+        "caesar": caesar_fields,
+        "plane": plane_fields,
+    }
+    return {
+        "aggregate": decompose(aggregate_fields),
+        "bySection": {
+            str(section): decompose(fields)
+            for section, fields in sorted(by_section.items())
+        },
+        "planeInference": {
+            "meanMillisecondsPerSlice": float(np.mean(latencies)),
+            "medianMillisecondsPerSlice": float(np.median(latencies)),
+            "p95MillisecondsPerSlice": float(np.percentile(latencies, 95.0)),
+            "outputShape": [dataset.height, dataset.width],
+            "planeCount": len(dataset),
+            "device": str(device),
+            "scope": "plane decoder only; excludes CAESAR compression and disk I/O",
+        },
+    }
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     if args.learning_rate <= 0.0:
@@ -339,13 +342,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         split_mode,
     ) = _resolve_block_sets(args)
     block = train_blocks[0]
-    config = PointDecoderConfig(
+    config = PlaneDecoderConfig(
         latent_channels=int(block.latent.shape[0]),
-        hidden_dimension=args.hidden_dimension,
-        hidden_layers=args.hidden_layers,
+        coarse_resolution=args.coarse_resolution,
+        output_resolution=args.resolution,
+        hidden_channels=args.hidden_channels,
+        minimum_channels=args.minimum_channels,
+        coarse_blocks=args.coarse_blocks,
         positional_frequencies=args.positional_frequencies,
+        slab_samples=args.slab_samples,
+        slab_radius_cells=args.slab_radius_cells,
     )
-    model = PointQueryDecoder(config).to(device)
+    model = PlaneConvolutionalDecoder(config).to(device)
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=args.learning_rate,
@@ -355,11 +363,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     train_dataset = MultiBlockPlaneDataset(
         train_blocks,
         sample_count=args.steps * args.batch_size,
-        height=args.train_resolution,
-        width=args.train_resolution,
+        height=args.resolution,
+        width=args.resolution,
         seed=args.seed,
         orientation=args.orientation,
         maximum_offset=args.maximum_offset,
+        target="base",
+        include_reference_fields=False,
     )
     first_loss: float | None = None
     final_loss = float("nan")
@@ -368,8 +378,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     for step in range(args.steps):
         batch = _numpy_batch(train_dataset, step * args.batch_size, args.batch_size)
         latent = torch.from_numpy(batch["latent"]).to(device)
-        points = torch.from_numpy(batch["points"]).to(device)
-        target = torch.from_numpy(batch["target_normalized"]).to(device)
+        points = torch.from_numpy(batch["points"])
+        points = points.reshape(
+            args.batch_size,
+            args.resolution,
+            args.resolution,
+            3,
+        ).to(device)
+        target = torch.from_numpy(batch["target_normalized"])
+        target = (
+            target.reshape(
+                args.batch_size,
+                args.resolution,
+                args.resolution,
+                1,
+            )
+            .permute(0, 3, 1, 2)
+            .to(device)
+        )
         prediction = model(latent, points)
         loss = torch.mean((prediction - target) ** 2)
 
@@ -385,8 +411,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     _synchronize(device)
     training_seconds = time.perf_counter() - start_training
 
-    checkpoint_path = save_point_decoder_checkpoint(
-        output_directory / "point_decoder.pt",
+    checkpoint_path = save_plane_decoder_checkpoint(
+        output_directory / "plane_decoder.pt",
         model,
         metadata={
             "artifactDirectories": [str(path) for path in artifact_directories],
@@ -395,6 +421,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "validation": _block_summary(validation_blocks),
             "test": _block_summary(test_blocks),
             "axisSemantic": block.axis_semantic,
+            "target": "caesarBase",
             "seed": args.seed,
             "orientation": args.orientation,
         },
@@ -403,29 +430,31 @@ def main(argv: Sequence[str] | None = None) -> int:
     validation_dataset = MultiBlockPlaneDataset(
         validation_blocks,
         sample_count=args.eval_planes * len(validation_blocks),
-        height=args.eval_resolution,
-        width=args.eval_resolution,
+        height=args.resolution,
+        width=args.resolution,
         seed=args.seed + 1_000_000,
         orientation=args.orientation,
         maximum_offset=args.maximum_offset,
+        target="base",
     )
     test_dataset = MultiBlockPlaneDataset(
         test_blocks,
         sample_count=args.eval_planes * len(test_blocks),
-        height=args.eval_resolution,
-        width=args.eval_resolution,
+        height=args.resolution,
+        width=args.resolution,
         seed=args.seed + 2_000_000,
         orientation=args.orientation,
         maximum_offset=args.maximum_offset,
+        target="base",
     )
-    validation_results = evaluate_point_decoder(
+    validation_results = evaluate_plane_decoder(
         model,
         validation_dataset,
         device=device,
         output_directory=output_directory,
         split_name="validation",
     )
-    test_results = evaluate_point_decoder(
+    test_results = evaluate_plane_decoder(
         model,
         test_dataset,
         device=device,
@@ -433,14 +462,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         split_name="test",
     )
     results = {
-        "formatVersion": 3 if block.base_volume is not None else 2,
+        "formatVersion": 1,
+        "target": "caesarBase",
         "splitMode": split_mode,
         "validation": validation_results,
         "test": test_results,
         "training": {
             "steps": args.steps,
             "batchSize": args.batch_size,
-            "planeShape": [args.train_resolution, args.train_resolution],
+            "planeShape": [args.resolution, args.resolution],
             "firstNormalizedMse": first_loss,
             "finalNormalizedMse": final_loss,
             "seconds": training_seconds,
@@ -463,7 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "test": _block_summary(test_blocks),
         },
     }
-    metrics_path = output_directory / "point_decoder_metrics.json"
+    metrics_path = output_directory / "plane_decoder_metrics.json"
     metrics_path.write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     print(metrics_path)
     return 0

@@ -33,7 +33,12 @@ from .datasets import (
     random_contained_plane,
     split_reference_blocks,
 )
-from .metrics import error_decomposition, field_error_metrics
+from .metrics import (
+    error_decomposition,
+    field_error_metrics,
+    plane_decoder_error_decomposition,
+    staged_error_decomposition,
+)
 
 __all__ = [
     "ArchiveMetadata",
@@ -57,6 +62,7 @@ __all__ = [
     "load_reference_collection",
     "open_stored_npz_array",
     "prepare_caesar_subset",
+    "plane_decoder_error_decomposition",
     "parse_index_specification",
     "random_contained_plane",
     "run_caesar_reference",
@@ -65,4 +71,5 @@ __all__ = [
     "save_caesar_reference",
     "stack_latent_depth",
     "split_reference_blocks",
+    "staged_error_decomposition",
 ]

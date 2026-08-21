@@ -25,7 +25,9 @@ class ReferenceBlock:
     raw_source: Path
     latent: np.ndarray
     raw_volume: np.ndarray
+    base_volume: np.ndarray | None
     caesar_volume: np.ndarray
+    residual_volume: np.ndarray | None
     scale: float
     offset: float
     frame_start: int
@@ -40,7 +42,11 @@ class ReferenceBlock:
     def __post_init__(self) -> None:
         latent = np.asarray(self.latent)
         raw_volume = np.asarray(self.raw_volume)
+        base_volume = None if self.base_volume is None else np.asarray(self.base_volume)
         caesar_volume = np.asarray(self.caesar_volume)
+        residual_volume = (
+            None if self.residual_volume is None else np.asarray(self.residual_volume)
+        )
         if latent.ndim != 4:
             raise ValueError(f"latent must be [C,D,H,W], got {latent.shape}")
         if raw_volume.ndim != 3:
@@ -49,6 +55,20 @@ class ReferenceBlock:
             raise ValueError(
                 "raw and CAESAR block shapes differ: "
                 f"{raw_volume.shape} vs {caesar_volume.shape}"
+            )
+        if (base_volume is None) != (residual_volume is None):
+            raise ValueError(
+                "base and residual volumes must either both be present or both be absent"
+            )
+        if base_volume is not None and base_volume.shape != raw_volume.shape:
+            raise ValueError(
+                "raw and base CAESAR block shapes differ: "
+                f"{raw_volume.shape} vs {base_volume.shape}"
+            )
+        if residual_volume is not None and residual_volume.shape != raw_volume.shape:
+            raise ValueError(
+                "raw and residual block shapes differ: "
+                f"{raw_volume.shape} vs {residual_volume.shape}"
             )
         if self.frame_end - self.frame_start != raw_volume.shape[0]:
             raise ValueError("block frame interval does not match its dense depth")
@@ -60,7 +80,9 @@ class ReferenceBlock:
             raise ValueError("block offset must be finite")
         object.__setattr__(self, "latent", latent)
         object.__setattr__(self, "raw_volume", raw_volume)
+        object.__setattr__(self, "base_volume", base_volume)
         object.__setattr__(self, "caesar_volume", caesar_volume)
+        object.__setattr__(self, "residual_volume", residual_volume)
 
     def normalize(self, values: np.ndarray) -> np.ndarray:
         return (np.asarray(values) - self.offset) / self.scale
@@ -109,8 +131,22 @@ def load_reference_blocks(
     latent_volume = np.load(directory / "q_latent.npy", mmap_mode="r")
     saved_raw_volume = np.load(directory / "original.npy", mmap_mode="r")
     caesar_volume = np.load(directory / "caesar_reference.npy", mmap_mode="r")
+    base_path = directory / "caesar_base.npy"
+    residual_path = directory / "caesar_residual.npy"
+    if base_path.is_file() != residual_path.is_file():
+        raise ValueError(
+            "staged artifacts require both CAESAR base and residual arrays"
+        )
+    base_volume = np.load(base_path, mmap_mode="r") if base_path.is_file() else None
+    residual_volume = (
+        np.load(residual_path, mmap_mode="r") if residual_path.is_file() else None
+    )
     if saved_raw_volume.shape != caesar_volume.shape:
         raise ValueError("saved raw and CAESAR dense volume shapes differ")
+    if base_volume is not None and base_volume.shape != saved_raw_volume.shape:
+        raise ValueError("saved raw and CAESAR base volume shapes differ")
+    if residual_volume is not None and residual_volume.shape != saved_raw_volume.shape:
+        raise ValueError("saved raw and CAESAR residual volume shapes differ")
 
     source_metadata = manifest.get("sourceMetadata", {})
     selection = source_metadata.get("selection", {})
@@ -173,7 +209,15 @@ def load_reference_blocks(
                 raw_source=raw_source,
                 latent=latent,
                 raw_volume=raw_block,
+                base_volume=(
+                    None if base_volume is None else base_volume[local_start:local_end]
+                ),
                 caesar_volume=caesar_volume[local_start:local_end],
+                residual_volume=(
+                    None
+                    if residual_volume is None
+                    else residual_volume[local_start:local_end]
+                ),
                 scale=_scalar_metadata(block, "scale"),
                 offset=_scalar_metadata(block, "offset"),
                 frame_start=block_start,
@@ -259,8 +303,16 @@ def load_reference_collection(
             block.source_frame_end,
         )
         if identity in identities:
-            raise ValueError(f"duplicate source block in reference collection: {identity}")
+            raise ValueError(
+                f"duplicate source block in reference collection: {identity}"
+            )
         identities.add(identity)
+    staged_availability = {
+        block.base_volume is not None and block.residual_volume is not None
+        for block in loaded
+    }
+    if len(staged_availability) != 1:
+        raise ValueError("reference collection mixes staged and legacy artifacts")
     return tuple(loaded)
 
 
@@ -327,7 +379,9 @@ def split_reference_blocks(
         ("test", split.test),
     ):
         if not selected:
-            raise ValueError(f"{name} split is empty; available sections are {available}")
+            raise ValueError(
+                f"{name} split is empty; available sections are {available}"
+            )
     return split
 
 
@@ -394,8 +448,9 @@ def random_contained_plane(
 class MultiBlockPlaneDataset:
     """Balanced deterministic planes over multiple latent/reference blocks.
 
-    The learned target is the full CAESAR reconstruction in normalized block
-    units. Raw samples are retained to measure total end-to-end error.
+    The learned target is either the full CAESAR reconstruction or its neural
+    base in normalized block units. Reference fields can be omitted from
+    training samples to avoid unnecessary dense-volume interpolation.
     """
 
     def __init__(
@@ -408,6 +463,8 @@ class MultiBlockPlaneDataset:
         seed: int,
         orientation: PlaneOrientation = "mixed",
         maximum_offset: float = 0.5,
+        target: Literal["caesar", "base"] = "caesar",
+        include_reference_fields: bool = True,
     ) -> None:
         if not blocks:
             raise ValueError("blocks must not be empty")
@@ -415,6 +472,10 @@ class MultiBlockPlaneDataset:
             raise ValueError("sample_count must be positive")
         if height <= 0 or width <= 0:
             raise ValueError("height and width must be positive")
+        if target not in {"caesar", "base"}:
+            raise ValueError("target must be caesar or base")
+        if target == "base" and any(block.base_volume is None for block in blocks):
+            raise ValueError("base targets require staged CAESAR artifacts")
         self.blocks = tuple(blocks)
         latent_shape = self.blocks[0].latent.shape
         if any(block.latent.shape != latent_shape for block in self.blocks[1:]):
@@ -425,6 +486,8 @@ class MultiBlockPlaneDataset:
         self.seed = int(seed)
         self.orientation = orientation
         self.maximum_offset = float(maximum_offset)
+        self.target = target
+        self.include_reference_fields = bool(include_reference_fields)
 
     def __len__(self) -> int:
         return self.sample_count
@@ -441,25 +504,33 @@ class MultiBlockPlaneDataset:
             maximum_offset=self.maximum_offset,
         )
         points = plane.points(self.height, self.width)
-        caesar_values = sample_volume(block.caesar_volume, points)
-        raw_values = sample_volume(block.raw_volume, points)
-        return {
+        caesar_values = (
+            sample_volume(block.caesar_volume, points)
+            if self.include_reference_fields or self.target == "caesar"
+            else None
+        )
+        base_values = (
+            sample_volume(block.base_volume, points)
+            if block.base_volume is not None
+            and (self.include_reference_fields or self.target == "base")
+            else None
+        )
+        target_values = caesar_values if self.target == "caesar" else base_values
+        if target_values is None:
+            raise RuntimeError(f"{self.target} target values were not sampled")
+        sample = {
             "latent": np.asarray(block.latent, dtype=np.float32),
             "points": points.astype(np.float32).reshape(-1, 3),
-            "target_normalized": block.normalize(caesar_values)
+            "target_normalized": block.normalize(target_values)
             .astype(np.float32)
             .reshape(-1, 1),
-            "caesar_values": caesar_values.reshape(-1, 1),
-            "raw_values": raw_values.reshape(-1, 1),
             "scale": np.asarray(block.scale, dtype=np.float32),
             "offset": np.asarray(block.offset, dtype=np.float32),
             "block_position": np.asarray(block_position, dtype=np.int64),
             "source_section_index": np.asarray(
                 block.source_section_index, dtype=np.int64
             ),
-            "source_frame_start": np.asarray(
-                block.source_frame_start, dtype=np.int64
-            ),
+            "source_frame_start": np.asarray(block.source_frame_start, dtype=np.int64),
             "plane_origin": plane.origin.astype(np.float32),
             "plane_axis_u": plane.axis_u.astype(np.float32),
             "plane_axis_v": plane.axis_v.astype(np.float32),
@@ -467,6 +538,23 @@ class MultiBlockPlaneDataset:
                 [*plane.u_bounds, *plane.v_bounds], dtype=np.float32
             ),
         }
+        if self.include_reference_fields:
+            if caesar_values is None:
+                raise RuntimeError("CAESAR reference values were not sampled")
+            sample["caesar_values"] = caesar_values.reshape(-1, 1)
+            sample["raw_values"] = sample_volume(block.raw_volume, points).reshape(
+                -1, 1
+            )
+        if (
+            self.include_reference_fields
+            and base_values is not None
+            and block.residual_volume is not None
+        ):
+            sample["base_values"] = base_values.reshape(-1, 1)
+            sample["residual_values"] = sample_volume(
+                block.residual_volume, points
+            ).reshape(-1, 1)
+        return sample
 
 
 class RandomPlaneDataset(MultiBlockPlaneDataset):
@@ -482,6 +570,8 @@ class RandomPlaneDataset(MultiBlockPlaneDataset):
         seed: int,
         orientation: PlaneOrientation = "mixed",
         maximum_offset: float = 0.5,
+        target: Literal["caesar", "base"] = "caesar",
+        include_reference_fields: bool = True,
     ) -> None:
         self.block = block
         super().__init__(
@@ -492,4 +582,6 @@ class RandomPlaneDataset(MultiBlockPlaneDataset):
             seed=seed,
             orientation=orientation,
             maximum_offset=maximum_offset,
+            target=target,
+            include_reference_fields=include_reference_fields,
         )

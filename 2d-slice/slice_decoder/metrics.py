@@ -61,3 +61,39 @@ def error_decomposition(
         "sliceDecoder": field_error_metrics(caesar_values, direct_values),
         "endToEnd": field_error_metrics(raw_values, direct_values),
     }
+
+
+def staged_error_decomposition(
+    raw_values: np.ndarray,
+    base_values: np.ndarray,
+    caesar_values: np.ndarray,
+    direct_values: np.ndarray,
+) -> dict[str, Any]:
+    """Separate neural-base, residual, direct-decoder, and total errors."""
+
+    return {
+        "baseCompression": field_error_metrics(raw_values, base_values),
+        "residualCorrection": field_error_metrics(base_values, caesar_values),
+        "finalCompression": field_error_metrics(raw_values, caesar_values),
+        "pointDecoderVsBase": field_error_metrics(base_values, direct_values),
+        "pointDecoderVsFinal": field_error_metrics(caesar_values, direct_values),
+        "endToEnd": field_error_metrics(raw_values, direct_values),
+    }
+
+
+def plane_decoder_error_decomposition(
+    raw_values: np.ndarray,
+    base_values: np.ndarray,
+    caesar_values: np.ndarray,
+    plane_values: np.ndarray,
+) -> dict[str, Any]:
+    """Separate CAESAR stages and plane-decoder errors."""
+
+    return {
+        "baseCompression": field_error_metrics(raw_values, base_values),
+        "residualCorrection": field_error_metrics(base_values, caesar_values),
+        "finalCompression": field_error_metrics(raw_values, caesar_values),
+        "planeDecoderVsBase": field_error_metrics(base_values, plane_values),
+        "planeDecoderVsFinal": field_error_metrics(caesar_values, plane_values),
+        "endToEnd": field_error_metrics(raw_values, plane_values),
+    }
